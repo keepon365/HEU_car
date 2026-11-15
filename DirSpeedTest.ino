@@ -92,6 +92,42 @@
  *      程序会先把占空比清零（ENA=0，桥臂关断），再按起步曲线重新加功率，
  *      避免电机反接瞬间的电流冲击和齿轮"磕"的一声。
  *
+ *  ---- 按住加速：像手柄扳机，按得越久越快，到顶封住 -------------------------
+ *
+ *      上面那条曲线只管"从静止到能转"的 0.2 秒。之后车一直是同一个速度，
+ *      直到松手 —— 这跟手柄的手感差得远：手柄是"越扣越深"。
+ *
+ *      现在的行为：按下瞬间给一个较低的目标（上限的 65%），随后**目标值随时长
+ *      线性上升**，按住 RAMP_FULL_MS 之后到上限，再按也不会更快。
+ *
+ *          占空比
+ *           120 ┤                          ╭────────────  上限（DUTY_BASE × 全局速度）
+ *               │                      ╱
+ *               │                  ╱
+ *            78 ┤──────╱           ← 目标值：0ms 时 78，1600ms 到顶
+ *               │   ╱
+ *            40 ┤╱                 ← 起步 kick（防打滑那 0.2 秒还在，两条曲线串联）
+ *              0 ┴──────┬──────────┬────────┬──────► 按住时长
+ *                       80ms      1600ms   之后
+ *
+ *      为什么"目标"和"实际"分开：如果直接把 currentDuty 按时长往上推，
+ *      起步那 0.2 秒的防打滑就被绕过去了（一上来就是 78，可能打滑）。
+ *      现在 rampedDuty() 只算"该到哪"，serviceRamp() 仍然按 ACCEL_PER_SEC
+ *      爬过去 —— 防打滑和越按越快互不干扰。
+ *
+ *      三个参数（RAMP_ON / RAMP_START_PCT / RAMP_FULL_MS）：
+ *        · 上限不用另设：就是 DUTY_BASE（再乘全局速度）。想"最快到这也行"，
+ *          直接把 DUTY_BASE 调小，整条曲线跟着降。想临时减半用 SPEED_PERMILLE。
+ *        · RAMP_START_PCT 别低于 65：左轮起转门槛 73，低于它会出现"按了不走"。
+ *        · RAMP_FULL_MS 是"摸到顶"的时间：1600 比较像手柄，2500 很线性，
+ *          800 基本就是"一按就窜"。
+ *
+ *      ⚠️ 转弯（<< >>）和原地旋转（- EQ）**不参与**这条曲线：
+ *         它们的 duty 本来就贴着起转门槛，再压到 65% 会"按了不转、松手才动"。
+ *
+ *      ⚠️ 计时只在"新按下 / 换动作"时重置，App 每 200ms 发来的重发帧不会重置，
+ *         否则速度永远爬不上去（这是最容易写错的地方）。
+ *
  *  ---- 接线（和 04_pwm 一模一样）-------------------------------------------
  *
  *      L298N          Arduino
@@ -162,7 +198,14 @@
 #define DEADMAN_ADAPT     1     // 抬手即停：1 = 阈值按**实测帧间隔**自动算（推荐）
 #define DEADMAN_FIXED_MS  300   // DEADMAN_ADAPT=0 时用的固定阈值；0 = 关掉抬手即停
 #define DEADMAN_PCT       135   // 自适应阈值 = 帧间隔 × 1.35（越小越跟手，越容易被丢帧误停）
-#define DEADMAN_MIN_MS    240   // 自适应下限：低于它就会和帧周期本身打架
+#define DEADMAN_MIN_MS    450   // 自适应下限：低于它就会和帧周期本身打架
+                                //   ★ 从 240 提到 450 的原因：App 每 200ms 一帧，
+                                //     丢一帧就是 400ms 的空档。以前丢了无所谓（速度是
+                                //     恒定的），现在一旦被看门狗停掉，再起步要重新爬
+                                //     1.6 秒才回到全速 —— 表现成"跑着跑着突然慢下来"。
+                                //     450 正好能吃住一次丢帧。
+                                //     放心：新版 App 松手会**主动发停车帧**，所以这个
+                                //     阈值只是"App 挂了/滑到后台"的兜底，不决定手感。
 #define DEADMAN_MAX_MS    800   // 自适应上限：App 发得慢时也不至于永远不停
 #define LED_PULSE_MS      30    // 收到有效信号后板载 LED 亮多久
 #define DEBOUNCE_MS       120   // 同一键码在此时间内重复出现视为重发帧
@@ -173,7 +216,7 @@
 #define DUTY_BACK          96   // 后退：比基准再慢 20%
                                 //   如果倒车"哼哼不转"，把它提到和 DUTY_BASE 一样
 #define DUTY_SPIN         108   // 原地旋转：基准的 90%（左右同值，转得圆）
-#define DUTY_TURN          95   // 左转 / 右转：只驱动外侧轮时的占空比
+#define DUTY_TURN          65   // 左转 / 右转：只驱动外侧轮时的占空比
                                 //   内侧轮是"断电自由滚动"（不是刹车），转弯半径由轮距决定，
                                 //   所以这个值只决定**转得多快**：调小 = 点一下转的角度小。
                                 //   下限约 80：再低要克服内侧轮拖滑阻力 + 左轮起转门槛（73），
@@ -189,7 +232,7 @@
 //   ⚠️ PWM 只有 8 位，duty=120 时 1 个 duty ≈ 0.83%。所以相邻 1~2 个千分点
 //   在低速动作上可能算出同一个整数、看不出差别。这是硬件分辨率下限，
 //   不是参数没生效 —— 要明显的变化，一次动 10~20（1~2%）。
-#define SPEED_PERMILLE   1000
+#define SPEED_PERMILLE   1100
 
 // ---- ★ 起步加速曲线（防打滑），三个参数见文件开头说明 ----
 #define DUTY_KICK          40   // 起步占空比：刚好能让轮子从静止转起来
@@ -198,6 +241,27 @@
 #define ACCEL_PER_SEC     300   // 爬升斜率：每秒增加多少占空比（越小越温柔）
 #define DECEL_PER_SEC     900   // 下降斜率：每秒减少多少占空比（比加速快，收油更跟手）
 #define RAMP_TICK_MS       10   // 曲线刷新周期（毫秒）
+
+// ---- ★ 按住加速（像手柄扳机：按得越久越快，到顶封住）----------------------
+//   前面的 DUTY_KICK/KICK_HOLD/ACCEL 解决的是"从静止到能转"这 0.2 秒的防打滑；
+//   这三个参数解决的是"按住之后速度还往上走"——两者是串联的：
+//
+//      占空比
+//        │                    ┌────── DUTY_BASE（上限，封顶不再涨）
+//        │                 ╱
+//        │              ╱       ← 目标值随时长线性上爬（这一段是新加的）
+//        │           ╱
+//        │  kick ──╱           ← 起步 0.2s：kick 40 → 目标起点
+//        └───────────────────────────────► 按住时长
+//        0        RAMP_FULL_MS
+//
+//   ⚠️ 上限就是 DUTY_BASE（再乘全局速度 SPEED_PERMILLE）：
+//     "不快过某个速度"这件事由 DUTY_BASE 管，不用再另设一个数。
+#define RAMP_ON            1    // 0 = 关掉，退回"按下即巡航速度"的老行为
+#define RAMP_START_PCT     55   // 刚按下时的目标 = 上限的 65%（120 → 78）
+                                //   别低于 65：左轮起转门槛 73，再低会"按了不动"
+#define RAMP_FULL_MS     2000   // 按住多久爬到上限（越大越线性，越小越蹿）
+                                //   1200 = 急性子  1600 = 适中  2500 = 很线性
 
 // ---- ★ 左右不同步补偿（标定结果已填好）----
 // TRIM = 该侧"起步阈值"比另一侧高出来的占空比。
@@ -345,13 +409,16 @@ uint8_t  targetDuty  = 0;        // 最终要到达的占空比（由按键表�
 uint8_t  currentDuty = 0;        // 现在实际输出的占空比（正在爬）
 uint32_t rampMs      = 0;        // 上次斜率更新的时刻
 uint32_t holdUntilMs = 0;        // 起步保持期结束的时刻（0 = 不在保持期）
+uint32_t holdStartMs = 0;        // 这一次"按住"从什么时候开始
+bool     holding     = false;    // 是否正按着（单独用标志，别拿 holdStartMs==0 判断，
+                                 //   上电后第 1 毫秒 millis() 就是 0，会误判成"没在按"）
 
 uint32_t lastCommandMs = 0;
 uint32_t lastCodeMs    = 0;
 uint32_t lastCode      = 0;
 bool     lastCodeMapped = false;   // 上一帧是否是本程序认得的动作键（防抖分支用它续命）
 uint16_t frameGapAvg = 200;        // 平滑后的"帧到达间隔"，自适应阈值基于它
-uint16_t deadmanMs   = 300;        // 当前生效的抬手即停阈值（随实测帧间隔自动更新）
+uint16_t deadmanMs   = DEADMAN_MIN_MS;   // 当前生效的抬手即停阈值（随实测帧间隔自动更新）
 
 /* ---------------------------------------------------------------------------
  *  左右增益：运行时可调 + 存 EEPROM
@@ -378,11 +445,17 @@ bool     moving        = false;            // 是否在运动（定义前移，�
 #define EE_TURN_ADDR   8
 #define EE_MAGIC       0xA5
 
-/* 把一个"标称占空比"按全局速度缩放：120 × 975/1000 = 117 */
+/* 把一个"标称占空比"按全局速度缩放：120 × 975/1000 = 117
+ *
+ * ★★ 必须用 uint32_t，不能用 uint16_t ★★
+ *   AVR 的 int 只有 16 位，120 × 1100 = 132000 会回绕成 928，
+ *   再 /1000 就变成 1 —— 车直接不动。而且只有 SPEED=1000 走上面
+ *   的短路分支才幸免，所以 bug 只在改过速度后才暴露。
+ *   教训：AVR 上任何 duty(≤255) × 三位数 都要显式提升到 uint32_t。 */
 uint8_t scaleSpeed(uint8_t duty)
 {
   if (speedPermille == 1000 || duty == 0) { return duty; }
-  const uint16_t d = ((uint16_t)duty * speedPermille + 500) / 1000;   // 四舍五入
+  const uint32_t d = ((uint32_t)duty * speedPermille + 500) / 1000;   // 四舍五入
   return (d > 255) ? 255 : (uint8_t)d;
 }
 
@@ -504,6 +577,8 @@ void     setOneWheel(uint8_t pinGo, uint8_t pinBack, uint8_t pinEn,
 void     applyOutput();
 void     setWheels(int8_t left, int8_t right, uint8_t duty);
 void     brakeCar();
+uint8_t  rampedDuty(uint8_t baseDuty);
+void     refreshRampedTarget();
 void     serviceRamp();
 void     pulseLed();
 void     serviceLed();
@@ -543,6 +618,14 @@ void setup()
   Serial.print (F("  hold="));          Serial.print(KICK_HOLD_MS);
   Serial.print (F("ms  accel="));       Serial.print(ACCEL_PER_SEC);
   Serial.println(F("/s"));
+#if RAMP_ON
+  Serial.print (F("   按住加速 从 ")); Serial.print(RAMP_START_PCT);
+  Serial.print (F("% 爬到 100%（上限 ")); Serial.print(scaleSpeed(DUTY_BASE));
+  Serial.print (F("），用时 ")); Serial.print(RAMP_FULL_MS);
+  Serial.println(F("ms"));
+#else
+  Serial.println(F("   按住加速 已关闭（按下即巡航速度）"));
+#endif
   Serial.print (F("   死区补偿 trim: 左=")); Serial.print(TRIM_LEFT);
   Serial.print (F("  右="));            Serial.println(TRIM_RIGHT);
   Serial.print (F("   增益 gain:     左=")); Serial.print(gainLeft);
@@ -689,18 +772,21 @@ void setWheels(int8_t left, int8_t right, uint8_t duty)
     return;
   }
 
-  const bool dirChanged = (left != wheelLeft) || (right != wheelRight);
+  const bool dirChanged  = (left != wheelLeft) || (right != wheelRight);
+  const bool freshPress  = dirChanged || !moving;   // 新的一次按下（含换动作）
+
   if (dirChanged)
   {
     currentDuty = 0;     // 换向先断电，再重新爬
     holdUntilMs = 0;
   }
+  if (freshPress) { holdStartMs = nowMs(); holding = true; }   // 按住计时从这里重新开始
 
   wheelLeft  = left;
   wheelRight = right;
   moving     = true;
   wheelCmdDuty = duty;                 // 记住标称值：改全局速度时要用它重算
-  targetDuty   = scaleSpeed(duty);
+  targetDuty   = scaleSpeed(rampedDuty(duty));   // 只给起点，之后由 serviceRamp 往上推
   lastCommandMs = nowMs();
 
   applyOutput();   // 方向立刻生效；占空比交给 serviceRamp() 爬向 targetDuty
@@ -718,6 +804,8 @@ void brakeCar()
   currentDuty = 0;
   wheelCmdDuty = 0;
   holdUntilMs = 0;
+  holdStartMs = 0;      // 松手 → 计时清零，下次按下从低速重新爬
+  holding     = false;
 
   digitalWrite(LEFT_MOTOR_GO, LOW);
   digitalWrite(LEFT_MOTOR_BACK, LOW);
@@ -725,6 +813,54 @@ void brakeCar()
   digitalWrite(RIGHT_MOTOR_BACK, LOW);
   analogWrite(LEFT_MOTOR_EN, 255);
   analogWrite(RIGHT_MOTOR_EN, 255);
+}
+
+/* ---------------------------------------------------------------------------
+ *  按住加速：目标占空比随着「这一次按住」的时长线性上升
+ * ---------------------------------------------------------------------------
+ *  baseDuty 是动作的巡航目标（前进 120 / 后退 96）。
+ *      按住 0ms            → base × RAMP_START_PCT%（120 → 78，慢速蠕行）
+ *      按住 RAMP_FULL_MS   → base 封顶（"不快过某个速度"就是这个 base）
+ *
+ *  ★ 它只改「目标」，不改「当前」：真正爬升的斜率仍由下面的起步曲线负责，
+ *    所以 0~0.2 秒那一段防打滑不会被破坏，两条曲线是串联的。
+ *  ★ holdStartMs 只在「新按下 / 换动作」时重置，重发帧不会重置 ——
+ *    否则每 200ms 来一帧，速度永远爬不上去。
+ * -------------------------------------------------------------------------*/
+uint8_t rampedDuty(uint8_t baseDuty)
+{
+#if !RAMP_ON
+  return baseDuty;
+#else
+  if (baseDuty == 0) { return 0; }
+
+  uint16_t startDuty = (uint16_t)baseDuty * RAMP_START_PCT / 100;
+  if (startDuty < DUTY_KICK) { startDuty = DUTY_KICK; }
+  if (startDuty >= baseDuty) { return baseDuty; }        // 参数配歪时别算出怪值
+
+  if (!holding) { return (uint8_t)startDuty; }
+
+  const uint32_t held = nowMs() - holdStartMs;
+  if (held >= (uint32_t)RAMP_FULL_MS) { return baseDuty; }
+
+  const uint16_t span = (uint16_t)(baseDuty - startDuty);
+  return (uint8_t)(startDuty + (uint16_t)((uint32_t)span * held / RAMP_FULL_MS));
+#endif
+}
+
+/* 每拍刷新目标值（在 serviceRamp 的最前面调）。
+ * 转弯 / 原地旋转不参与曲线：它们的 duty 本来就贴着起转门槛（约 80），
+ * 再压到 65% 会「按了不转、松手才动」，手感反而更差。 */
+void refreshRampedTarget()
+{
+  if (!moving || wheelCmdDuty == 0) { return; }
+
+#if RAMP_ON
+  const bool straight = (wheelLeft == wheelRight && wheelLeft != DIR_STOP);
+  if (!straight) { return; }
+#endif
+
+  targetDuty = scaleSpeed(rampedDuty(wheelCmdDuty));
 }
 
 /* ---------------------------------------------------------------------------
@@ -744,6 +880,8 @@ void brakeCar()
  * -------------------------------------------------------------------------*/
 void serviceRamp()
 {
+  refreshRampedTarget();          // 按住越久，目标值越高（封顶在 DUTY_BASE）
+
   if (currentDuty == targetDuty) { return; }
 
   const uint32_t t = nowMs();

@@ -22,8 +22,16 @@ set TRIM_R=0
 set DUTY_BASE=120
 set DUTY_BACK=96
 set DUTY_SPIN=108
-set DUTY_TURN=95
-set SPEED=1000
+set DUTY_TURN=65
+set SPEED=1100
+set RAMP_START=55
+set RAMP_MS=2000
+rem   RAMP_START : speed when you just pressed, in percent of the cap.
+rem                65 = start at 65%% of DUTY_BASE, climb to 100%%. below 60
+rem                the left wheel may not start at all (its threshold is 73).
+rem   RAMP_MS    : how long you must hold to reach the cap. 1600 = like a
+rem                gamepad trigger, 2500 = very linear, 800 = almost instant.
+rem                the cap itself is DUTY_BASE (times SPEED).
 rem   DUTY_TURN : outer wheel only, used by << and >> (left / right turn)
 rem               smaller = each tap turns a smaller angle. min about 80.
 rem   SPEED     : 1000 = 100.0%%. 975 = 97.5%%. 1050 = 105%%. 600..1400
@@ -43,6 +51,7 @@ echo   GAIN   L=%GAIN_L%   R=%GAIN_R%
 echo   TRIM   L=%TRIM_L%   R=%TRIM_R%
 echo   DUTY   FWD=%DUTY_BASE%   BACK=%DUTY_BACK%   SPIN=%DUTY_SPIN%   TURN=%DUTY_TURN%
 echo   SPEED  %SPEED%   (1000 = 100.0%%)
+echo   RAMP   start %RAMP_START%%% of cap, full at %RAMP_MS% ms (cap = DUTY_BASE)
 echo --------------------------------------------------------------
 
 if not exist "%SKETCH%" goto nosketch
@@ -50,10 +59,10 @@ if not exist "%CLI%" for %%c in (arduino-cli.exe) do set "CLI=%%~$PATH:c"
 if not exist "%CLI%" goto nocli
 
 echo [1/5] patch DirSpeedTest.ino ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='%SKETCH%'; $s=[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8); $m=@(@('GAIN_LEFT',$env:GAIN_L),@('GAIN_RIGHT',$env:GAIN_R),@('TRIM_LEFT',$env:TRIM_L),@('TRIM_RIGHT',$env:TRIM_R),@('DUTY_BASE',$env:DUTY_BASE),@('DUTY_BACK',$env:DUTY_BACK),@('DUTY_SPIN',$env:DUTY_SPIN),@('DUTY_TURN',$env:DUTY_TURN),@('SPEED_PERMILLE',$env:SPEED)); foreach($x in $m){ $s=[regex]::Replace($s,'(?m)^(#define\s+'+$x[0]+'\s+)\d+','${1}'+$x[1]) }; [IO.File]::WriteAllText($p,$s,(New-Object System.Text.UTF8Encoding($false)))"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='%SKETCH%'; $s=[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8); $m=@(@('GAIN_LEFT',$env:GAIN_L),@('GAIN_RIGHT',$env:GAIN_R),@('TRIM_LEFT',$env:TRIM_L),@('TRIM_RIGHT',$env:TRIM_R),@('DUTY_BASE',$env:DUTY_BASE),@('DUTY_BACK',$env:DUTY_BACK),@('DUTY_SPIN',$env:DUTY_SPIN),@('DUTY_TURN',$env:DUTY_TURN),@('SPEED_PERMILLE',$env:SPEED),@('RAMP_START_PCT',$env:RAMP_START),@('RAMP_FULL_MS',$env:RAMP_MS)); foreach($x in $m){ $s=[regex]::Replace($s,'(?m)^(#define\s+'+$x[0]+'\s+)\d+','${1}'+$x[1]) }; [IO.File]::WriteAllText($p,$s,(New-Object System.Text.UTF8Encoding($false)))"
 if errorlevel 1 goto patchfail
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=[IO.File]::ReadAllText('%SKETCH%',[Text.Encoding]::UTF8); foreach($n in 'GAIN_LEFT','GAIN_RIGHT','TRIM_LEFT','TRIM_RIGHT','DUTY_BASE','DUTY_BACK','DUTY_SPIN','DUTY_TURN','SPEED_PERMILLE'){ $m=[regex]::Match($s,'(?m)^#define\s+'+$n+'\s+(\d+)'); if($m.Success){ Write-Host ('   '+$n.PadRight(14)+'= '+$m.Groups[1].Value) } }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=[IO.File]::ReadAllText('%SKETCH%',[Text.Encoding]::UTF8); foreach($n in 'GAIN_LEFT','GAIN_RIGHT','TRIM_LEFT','TRIM_RIGHT','DUTY_BASE','DUTY_BACK','DUTY_SPIN','DUTY_TURN','SPEED_PERMILLE','RAMP_START_PCT','RAMP_FULL_MS'){ $m=[regex]::Match($s,'(?m)^#define\s+'+$n+'\s+(\d+)'); if($m.Success){ Write-Host ('   '+$n.PadRight(14)+'= '+$m.Groups[1].Value) } }"
 
 echo.
 echo [2/5] find board ...
