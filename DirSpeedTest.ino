@@ -108,17 +108,50 @@
  *  ---- 怎么判断"测试通过" ---------------------------------------------------
  *
  *      1. 按 CH → 车往前冲，速度明显比按 "+" 快；串口（DEBUG_SERIAL=1）打印
- *         duty=255，按住 "+" 打印 duty=120。
+ *         duty=120，按 "+" 打印 duty=96。
  *      2. 按 "1"~"9" 没反应（本程序没有档位功能）→ 说明你烧的是这个程序，不是 04_pwm。
  *      3. 按 ">>|" 车立刻停住、推不动（短路制动），不是慢慢溜停。
  *      4. 左右轮速度应该一致（两路 PWM 同属 Timer0，频率相同）。
  *         如果一边明显快，先查那个电机的机械阻力，再查 ENA/ENB 是否有一个没接好。
+ *
+ *  ---- 抬手即停（像真遥控器那样）--------------------------------------------
+ *
+ *      红外本身是"开关量"：一个键按一次发一帧，松手时**什么都不发**——
+ *      没有"松手"这个信号可收。所以想做到松手就停，靠的不是收到什么，
+ *      而是**多久没收到**：看门狗。
+ *
+ *      App 按住不放时会反复补发同一帧（holdTick），于是
+ *      "还按着" = 帧一直来，"松手了" = 帧断了。
+ *
+ *      ---- 阈值为什么不能写死 ------------------------------------------------
+ *
+ *      写死一个数会两头不讨好：
+ *        · 太小（比如 250）→ App 万一 300ms 才发一帧，按住也会被误判成松手；
+ *        · 太大（比如 600）→ 松手后车还要多跑半秒，手感发飘。
+ *      所以改成**按实测间隔自己算**：
+ *
+ *          阈值 = 平滑后的帧间隔 × 1.35，限制在 [240, 800] ms
+ *
+ *      开机用 200ms 打底；按住一两秒后就会收敛到你手机上真实的间隔。
+ *      串口每帧打印 `[帧] 间隔=xxx  阈值=yyy`，松手后打印
+ *      `[超时] 松手 268ms（阈值 270ms）→ 自动停车`，两个数一对就知道
+ *      剩余延迟花在哪了。
+ *
+ *      想更跟手：DEADMAN_PCT 改 125（代价是丢一帧就停，会一顿一顿）。
+ *      想抗干扰：改 150~170。彻底关掉：DEADMAN_FIXED_MS 改 0 且 DEADMAN_ADAPT 改 0。
+ *
+ *      两个配套细节（已改好，别改回去）：
+ *        · 防抖分支也要刷新 lastCommandMs —— App 一帧里塞多组紧凑重发时，
+ *          第 2、3 组会被 DEBOUNCE_MS 滤掉，不刷新就会把"按住"误判成"松手"，
+ *          车会一顿一顿地停。
+ *        · 只有本程序认得的动作键才续命（lastCodeMapped）。陌生键码不该让车一直跑。
  *
  *  ---- 编译 ----------------------------------------------------------------
  *      pwsh -File .\tools\build.ps1 -SketchDir .\05_dir_speed\DirSpeedTest
  * ==========================================================================*/
 
 #include <IRremote.h>
+#include <EEPROM.h>       // 存左右增益，改完不用重烧
 
 /* ---------------------------------------------------------------------------
  *  【可调参数】
@@ -126,7 +159,11 @@
 #define DEBUG_SERIAL      1     // 测试程序默认开着：串口 9600 能看到每个动作的 duty
                                 // 正式跑车（不需要看串口）时改回 0，响应会更快
 #define STOP_ON_UNKNOWN   1     // 解不出协议的信号 → 停车
-#define AUTO_STOP_MS      0     // >0 = 多久没收到按键就自动停（毫秒，0=关）
+#define DEADMAN_ADAPT     1     // 抬手即停：1 = 阈值按**实测帧间隔**自动算（推荐）
+#define DEADMAN_FIXED_MS  300   // DEADMAN_ADAPT=0 时用的固定阈值；0 = 关掉抬手即停
+#define DEADMAN_PCT       135   // 自适应阈值 = 帧间隔 × 1.35（越小越跟手，越容易被丢帧误停）
+#define DEADMAN_MIN_MS    240   // 自适应下限：低于它就会和帧周期本身打架
+#define DEADMAN_MAX_MS    800   // 自适应上限：App 发得慢时也不至于永远不停
 #define LED_PULSE_MS      30    // 收到有效信号后板载 LED 亮多久
 #define DEBOUNCE_MS       120   // 同一键码在此时间内重复出现视为重发帧
 
@@ -136,6 +173,23 @@
 #define DUTY_BACK          96   // 后退：比基准再慢 20%
                                 //   如果倒车"哼哼不转"，把它提到和 DUTY_BASE 一样
 #define DUTY_SPIN         108   // 原地旋转：基准的 90%（左右同值，转得圆）
+#define DUTY_TURN          95   // 左转 / 右转：只驱动外侧轮时的占空比
+                                //   内侧轮是"断电自由滚动"（不是刹车），转弯半径由轮距决定，
+                                //   所以这个值只决定**转得多快**：调小 = 点一下转的角度小。
+                                //   下限约 80：再低要克服内侧轮拖滑阻力 + 左轮起转门槛（73），
+                                //   会出现"按了不转、松手才动"。
+                                //   ⚠️ 左转靠右轮（门槛 60）、右转靠左轮（门槛 73），
+                                //   同一个值下右转会略慢于左转，这是正常的。
+
+// ---- ★ 全局速度（千分比，带一位以上小数精度）------------------------------
+//   1000 = 1.000 倍（原始速度）   975 = 97.5%（慢 2.5%）   1050 = 105%
+//   作用在"目标巡航占空比"上：前进 / 后退 / 转弯 / 旋转全都跟着缩放，
+//   但起步 KICK（DUTY_KICK）不缩放 —— 那是"刚好能转起来"的门槛，不该跟着变。
+//   范围 600 ~ 1400。
+//   ⚠️ PWM 只有 8 位，duty=120 时 1 个 duty ≈ 0.83%。所以相邻 1~2 个千分点
+//   在低速动作上可能算出同一个整数、看不出差别。这是硬件分辨率下限，
+//   不是参数没生效 —— 要明显的变化，一次动 10~20（1~2%）。
+#define SPEED_PERMILLE   1000
 
 // ---- ★ 起步加速曲线（防打滑），三个参数见文件开头说明 ----
 #define DUTY_KICK          40   // 起步占空比：刚好能让轮子从静止转起来
@@ -174,11 +228,26 @@
 
 // ---- ★ 增益补偿（巡航跑直线），256 = 1.0 倍 ----
 // TRIM 解决"谁先动"，GAIN 解决"谁转得快"，两者别混用。
-//   落地直行往**左**偏 → 左轮转得快 → GAIN_LEFT 调小（250、245…每次 -3~5）
-//   落地直行往**右**偏 → 右轮转得快 → GAIN_RIGHT 调小
-//   256 表示不给该侧打折；250 ≈ 97.7%，240 ≈ 93.8%。
-#define GAIN_LEFT        236    // 左轮偏快约 8%（全程左偏 >30cm/米 估算），先试 236
-#define GAIN_RIGHT       256
+//
+//   ★ 方向别搞反（本机就在这里错过一次，白调了很久）：
+//       车往**左**偏 = 右轮单位时间跑得更远（左轮慢 / 右轮空转打滑）→ 压 **右**轮
+//       车往**右**偏 = 左轮单位时间跑得更远                        → 压 **左**轮
+//     口诀：车永远朝"慢"的那一侧拐，所以要调的是**快**的那一侧。
+//     之前填的 GAIN_LEFT=236 是把左轮压到 92%，而左轮本来就是慢的一侧 —— 
+//     等于在制造左偏，越调越歪。
+//
+//   256 = 不打折；250 ≈ 97.7%（每 2 米少走约 4.6cm）；240 ≈ 93.8%。
+//   千分之几的差，跑 2 米就能看出十几厘米，所以每次动 ±2~4 就够，别一次跳 10。
+#define GAIN_LEFT        256    // 左轮：不打折（左轮摩擦大，是"慢"的一侧）
+#define GAIN_RIGHT       225    // 右轮摩擦小、更容易转 → 压低它等于把车头往右掰
+
+// ---- ★ 增益只对"直行"生效 ----
+// 单边转弯和原地旋转也压一轮，会把动作本身带歪，而且这种歪是白歪的：
+//   · 原地旋转：两边给同一个 duty，压右轮 → 转出来是弧线，不是原地圆转
+//   · 单边转弯：只驱动一只轮子，补偿在这里没有任何"纠偏"意义
+// 立起车（轮子悬空）压 GAIN 时最明显：直行看着没问题，一按旋转就往右画圈。
+// 改成 1 之后，转弯和旋转恢复左右对称，直行照样补偿。
+#define GAIN_STRAIGHT_ONLY 1    // 1 = 仅直行/后退补偿（推荐）；0 = 所有动作都补偿（旧行为）
 
 #if (COMP_FADE_START < DUTY_KICK)
 #error "COMP_FADE_START 不能小于 DUTY_KICK，否则起步阶段补偿不完整"
@@ -256,8 +325,8 @@ const KeyAction KEY_TABLE[] =
   // 键码            名字          左轮          右轮          巡航占空比
   { 0x00FF629DUL, "CH   前进",  DIR_FORWARD,  DIR_FORWARD,  DUTY_BASE },
   { 0x00FFA857UL, "+    后退",  DIR_BACKWARD, DIR_BACKWARD, DUTY_BACK },
-  { 0x00FF22DDUL, "<<   左转",  DIR_STOP,     DIR_FORWARD,  DUTY_BASE },
-  { 0x00FFC23DUL, ">||  右转",  DIR_FORWARD,  DIR_STOP,     DUTY_BASE },
+  { 0x00FF22DDUL, "<<   左转",  DIR_STOP,     DIR_FORWARD,  DUTY_TURN },
+  { 0x00FFC23DUL, ">||  右转",  DIR_FORWARD,  DIR_STOP,     DUTY_TURN },
   { 0x00FF02FDUL, ">>|  停车",  DIR_STOP,     DIR_STOP,     0         },
   { 0x00FFE01FUL, "-    左旋",  DIR_BACKWARD, DIR_FORWARD,  DUTY_SPIN },
   { 0x00FF906FUL, "EQ   右旋",  DIR_FORWARD,  DIR_BACKWARD, DUTY_SPIN },
@@ -280,7 +349,149 @@ uint32_t holdUntilMs = 0;        // 起步保持期结束的时刻（0 = 不在�
 uint32_t lastCommandMs = 0;
 uint32_t lastCodeMs    = 0;
 uint32_t lastCode      = 0;
-bool     moving        = false;
+bool     lastCodeMapped = false;   // 上一帧是否是本程序认得的动作键（防抖分支用它续命）
+uint16_t frameGapAvg = 200;        // 平滑后的"帧到达间隔"，自适应阈值基于它
+uint16_t deadmanMs   = 300;        // 当前生效的抬手即停阈值（随实测帧间隔自动更新）
+
+/* ---------------------------------------------------------------------------
+ *  左右增益：运行时可调 + 存 EEPROM
+ * ---------------------------------------------------------------------------
+ *  为什么不在代码里改：每试一次都要重烧（十几秒）+ 拔线，跑完 2 米再回来看结果，
+ *  一轮两分钟起步。改成串口发指令，改完立刻生效，按 W 存盘，下次上电还在。
+ *
+ *  串口监视器（9600）发送，带不带换行都行：
+ *      L250   左轮增益改成 250        R248   右轮增益改成 248
+ *      S975   全局速度 97.5%          T95    转弯外侧轮 duty=95
+ *      ?      显示当前值              W      写入 EEPROM
+ *      D      恢复代码里的默认值（并擦掉存档）
+ * -------------------------------------------------------------------------*/
+uint16_t gainLeft  = GAIN_LEFT;
+uint16_t gainRight = GAIN_RIGHT;
+uint16_t speedPermille = SPEED_PERMILLE;   // 全局速度，1000 = 原始速度
+uint8_t  turnDuty      = DUTY_TURN;        // 单边转弯的占空比（运行时可变）
+uint8_t  wheelCmdDuty  = 0;                // 当前动作的"标称"占空比（还没乘全局速度）
+bool     moving        = false;            // 是否在运动（定义前移，串口改速度时要用）
+
+#define EE_MAGIC_ADDR  0
+#define EE_DATA_ADDR   2
+#define EE_SPEED_ADDR  6
+#define EE_TURN_ADDR   8
+#define EE_MAGIC       0xA5
+
+/* 把一个"标称占空比"按全局速度缩放：120 × 975/1000 = 117 */
+uint8_t scaleSpeed(uint8_t duty)
+{
+  if (speedPermille == 1000 || duty == 0) { return duty; }
+  const uint16_t d = ((uint16_t)duty * speedPermille + 500) / 1000;   // 四舍五入
+  return (d > 255) ? 255 : (uint8_t)d;
+}
+
+char    cmdBuf[10];
+uint8_t cmdLen = 0;
+
+void printCal()
+{
+  Serial.print(F("[校准] 左="));  Serial.print(gainLeft);
+  Serial.print(F("  右="));       Serial.print(gainRight);
+  Serial.print(F("  速度="));     Serial.print(speedPermille / 10);
+  Serial.print('.');
+  Serial.print(speedPermille % 10);
+  Serial.print(F("%  转弯="));    Serial.print(scaleSpeed(turnDuty));
+  Serial.print(F("  （右/左="));
+  Serial.print((uint16_t)((uint32_t)gainRight * 1000 / gainLeft));
+  Serial.println(F("/1000）"));
+
+  // 机器可读的一行：烧录脚本（烧录.bat）靠它核对"实际生效值"。
+  // 故意只用 ASCII，避免脚本按不同编码解析中文而出错。**别删这一行**。
+  Serial.print(F("[CAL] L="));  Serial.print(gainLeft);
+  Serial.print(F(" R="));       Serial.print(gainRight);
+  Serial.print(F(" S="));       Serial.print(speedPermille);
+  Serial.print(F(" FWD="));     Serial.print(scaleSpeed(DUTY_BASE));
+  Serial.print(F(" TURN="));    Serial.println(scaleSpeed(turnDuty));
+}
+
+void loadCal()
+{
+  if (EEPROM.read(EE_MAGIC_ADDR) != EE_MAGIC) { return; }
+  uint16_t gl = 0, gr = 0, sp = 0;
+  EEPROM.get(EE_DATA_ADDR,      gl);
+  EEPROM.get(EE_DATA_ADDR + 2,  gr);
+  EEPROM.get(EE_SPEED_ADDR,     sp);
+  if (gl >= 150 && gl <= 400) { gainLeft  = gl; }
+  if (gr >= 150 && gr <= 400) { gainRight = gr; }
+  if (sp >= 600 && sp <= 1400) { speedPermille = sp; }
+
+  const uint8_t td = EEPROM.read(EE_TURN_ADDR);
+  if (td >= 60 && td <= 160) { turnDuty = td; }
+}
+
+void saveCal()
+{
+  EEPROM.put(EE_DATA_ADDR,      gainLeft);
+  EEPROM.put(EE_DATA_ADDR + 2,  gainRight);
+  EEPROM.put(EE_SPEED_ADDR,     speedPermille);
+  EEPROM.write(EE_TURN_ADDR,    turnDuty);
+  EEPROM.write(EE_MAGIC_ADDR, EE_MAGIC);
+}
+
+void handleSerialCmd()
+{
+  cmdBuf[cmdLen] = '\0';
+  char k = cmdBuf[0];
+  if (k >= 'a' && k <= 'z') { k = (char)(k - 32); }   // 小写也认
+
+  int16_t v = 0;
+  for (uint8_t i = 1; i < cmdLen; i++)
+  {
+    if (cmdBuf[i] < '0' || cmdBuf[i] > '9') { break; }
+    v = (int16_t)(v * 10 + (cmdBuf[i] - '0'));
+  }
+
+  switch (k)
+  {
+    case 'L': if (v >= 150 && v <= 400) { gainLeft  = (uint16_t)v; } break;
+    case 'R': if (v >= 150 && v <= 400) { gainRight = (uint16_t)v; } break;
+    case 'S':
+      if (v >= 600 && v <= 1400)
+      {
+        speedPermille = (uint16_t)v;
+        // 正在走的话立刻按新速度重算目标（ramp 会平滑爬过去，不会突跳）
+        if (moving) { targetDuty = scaleSpeed(wheelCmdDuty); }
+      }
+      break;
+    case 'T': if (v >= 60 && v <= 160) { turnDuty = (uint8_t)v; } break;
+    case 'W': saveCal(); Serial.println(F("[校准] 已写入 EEPROM")); break;
+    case 'D':
+      gainLeft  = GAIN_LEFT;
+      gainRight = GAIN_RIGHT;
+      speedPermille = SPEED_PERMILLE;
+      turnDuty = DUTY_TURN;
+      EEPROM.write(EE_MAGIC_ADDR, 0x00);              // 擦掉存档
+      Serial.println(F("[校准] 已恢复默认值"));
+      break;
+    case '?': break;
+    default: return;
+  }
+  printCal();
+}
+
+void serviceSerial()
+{
+#if DEBUG_SERIAL
+  while (Serial.available() > 0)
+  {
+    const char c = (char)Serial.read();
+    if (c == '\r' || c == '\n')
+    {
+      if (cmdLen > 0) { handleSerialCmd(); cmdLen = 0; }
+    }
+    else if (cmdLen < sizeof(cmdBuf) - 1)
+    {
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+#endif
+}
 bool     ledOn         = false;
 uint32_t ledOffAtMs    = 0;
 
@@ -318,20 +529,34 @@ void setup()
 
 #if DEBUG_SERIAL
   Serial.begin(9600);
+  loadCal();                     // 先把 EEPROM 里的左右增益读回来，再打印横幅
   Serial.println(F("=============================================="));
   Serial.println(F(" DirSpeedTest：降速 + 起步防打滑"));
-  Serial.print (F("   前进 duty=")); Serial.println(DUTY_BASE);
-  Serial.print (F("   后退 duty=")); Serial.println(DUTY_BACK);
-  Serial.print (F("   旋转 duty=")); Serial.println(DUTY_SPIN);
+  Serial.print (F("   全局速度="));      Serial.print(speedPermille / 10);
+  Serial.print (F("."));                 Serial.print(speedPermille % 10);
+  Serial.println(F("%"));
+  Serial.print (F("   前进 duty=")); Serial.println(scaleSpeed(DUTY_BASE));
+  Serial.print (F("   后退 duty=")); Serial.println(scaleSpeed(DUTY_BACK));
+  Serial.print (F("   转弯 duty=")); Serial.println(scaleSpeed(turnDuty));
+  Serial.print (F("   旋转 duty=")); Serial.println(scaleSpeed(DUTY_SPIN));
   Serial.print (F("   起步曲线 kick=")); Serial.print(DUTY_KICK);
   Serial.print (F("  hold="));          Serial.print(KICK_HOLD_MS);
   Serial.print (F("ms  accel="));       Serial.print(ACCEL_PER_SEC);
   Serial.println(F("/s"));
   Serial.print (F("   死区补偿 trim: 左=")); Serial.print(TRIM_LEFT);
   Serial.print (F("  右="));            Serial.println(TRIM_RIGHT);
-  Serial.print (F("   增益 gain:     左=")); Serial.print(GAIN_LEFT);
-  Serial.print (F("  右="));            Serial.println(GAIN_RIGHT);
+  Serial.print (F("   增益 gain:     左=")); Serial.print(gainLeft);
+  Serial.print (F("  右="));            Serial.println(gainRight);
   Serial.print (F("   EN 交叉="));       Serial.println(SWAP_EN ? F("是(左轮用D6/右轮用D5)") : F("否"));
+  Serial.print (F("   抬手即停="));
+#if DEADMAN_ADAPT
+  Serial.print(F("自适应 1.35×帧间隔，起始阈值 "));
+  Serial.print(deadmanMs);
+  Serial.println(F("ms"));
+#else
+  Serial.print(DEADMAN_FIXED_MS);
+  Serial.println(F("ms（固定阈值）"));
+#endif
   Serial.println(F(" 按 CH=前进  +=后退  >>|=停车"));
   Serial.println(F("=============================================="));
 #endif
@@ -393,7 +618,9 @@ uint8_t buildDuty(uint8_t cmd, uint8_t trim, uint16_t gain, uint8_t target)
 {
   if (cmd == 0) { return 0; }
 
-  uint16_t duty = cmd;
+  // 用 32 位：gain 允许超过 256（把慢的那侧调快），
+  // duty(≤295) × 400 会超出 uint16，用 16 位会溢出回绕成小值。
+  uint32_t duty = cmd;
 
   // ---- ① 死区补偿 ----
   if (trim != 0)
@@ -425,8 +652,19 @@ uint8_t buildDuty(uint8_t cmd, uint8_t trim, uint16_t gain, uint8_t target)
 /* 把当前方向 + 当前占空比（含左右补偿）写到硬件 */
 void applyOutput()
 {
-  const uint8_t dutyL = buildDuty(currentDuty, TRIM_LEFT, GAIN_LEFT, targetDuty);
-  const uint8_t dutyR = buildDuty(currentDuty, TRIM_RIGHT, GAIN_RIGHT, targetDuty);
+#if GAIN_STRAIGHT_ONLY
+  // 只有两轮同向（前进/后退）才算直行；单边转弯、原地旋转不套 GAIN，
+  // 否则旋转会画弧、左右转弯半径不一致。
+  const bool straight = (wheelLeft == wheelRight && wheelLeft != DIR_STOP);
+  const uint16_t gL = straight ? gainLeft  : (uint16_t)256;
+  const uint16_t gR = straight ? gainRight : (uint16_t)256;
+#else
+  const uint16_t gL = gainLeft;
+  const uint16_t gR = gainRight;
+#endif
+
+  const uint8_t dutyL = buildDuty(currentDuty, TRIM_LEFT,  gL, targetDuty);
+  const uint8_t dutyR = buildDuty(currentDuty, TRIM_RIGHT, gR, targetDuty);
 
   setOneWheel(LEFT_MOTOR_GO,  LEFT_MOTOR_BACK,  LEFT_MOTOR_EN,
               wheelLeft,  false, wheelLeft  == DIR_STOP ? 0 : dutyL);
@@ -461,7 +699,8 @@ void setWheels(int8_t left, int8_t right, uint8_t duty)
   wheelLeft  = left;
   wheelRight = right;
   moving     = true;
-  targetDuty = duty;
+  wheelCmdDuty = duty;                 // 记住标称值：改全局速度时要用它重算
+  targetDuty   = scaleSpeed(duty);
   lastCommandMs = nowMs();
 
   applyOutput();   // 方向立刻生效；占空比交给 serviceRamp() 爬向 targetDuty
@@ -477,6 +716,7 @@ void brakeCar()
   moving      = false;
   targetDuty  = 0;
   currentDuty = 0;
+  wheelCmdDuty = 0;
   holdUntilMs = 0;
 
   digitalWrite(LEFT_MOTOR_GO, LOW);
@@ -581,17 +821,42 @@ void serviceLed()
   }
 }
 
+/* 用实测的帧间隔更新阈值：App 每 200ms 发一帧，走的就是这里。
+ * 只采信 100~2000ms 的间隔 —— 小于 100 的是同一次按下的紧凑重发，
+ * 大于 2000 的是"歇了一会儿又按"，都不该拿来当基准。 */
+void noteFrameGap(uint32_t gap)
+{
+#if DEADMAN_ADAPT
+  if (gap < 100 || gap > 2000) { return; }
+  frameGapAvg = (uint16_t)(((uint32_t)frameGapAvg * 3 + gap) / 4);   // 一阶低通，抗单次抖动
+  uint32_t th = (uint32_t)frameGapAvg * DEADMAN_PCT / 100;
+  if (th < DEADMAN_MIN_MS) { th = DEADMAN_MIN_MS; }
+  if (th > DEADMAN_MAX_MS) { th = DEADMAN_MAX_MS; }
+  deadmanMs = (uint16_t)th;
+#else
+  (void)gap;
+#endif
+}
+
 void serviceAutoStop()
 {
-#if (AUTO_STOP_MS > 0)
-  if (moving && (nowMs() - lastCommandMs > (unsigned long)AUTO_STOP_MS))
+  if (!moving) { return; }
+
+  const uint16_t limit = DEADMAN_ADAPT ? deadmanMs : (uint16_t)DEADMAN_FIXED_MS;
+  if (limit == 0) { return; }                       // 0 = 关掉抬手即停
+
+  const uint32_t late = nowMs() - lastCommandMs;
+  if (late > (uint32_t)limit)
   {
   #if DEBUG_SERIAL
-    Serial.println(F("[超时] 自动停车"));
+    Serial.print(F("[超时] 松手 "));
+    Serial.print(late);
+    Serial.print(F("ms（阈值 "));
+    Serial.print(limit);
+    Serial.println(F("ms）→ 自动停车"));
   #endif
     brakeCar();
   }
-#endif
 }
 
 uint32_t nowMs()
@@ -610,9 +875,7 @@ void handleFrame()
   // A. NEC 重发帧（按住不放时遥控器发这个）
   if (code == 0xFFFFFFFFUL || results.bits == 0)
   {
-#if (AUTO_STOP_MS > 0)
-    lastCommandMs = t;
-#endif
+    lastCommandMs = t;      // 重发帧同样算"还按着"
     return;
   }
 
@@ -635,6 +898,9 @@ void handleFrame()
   if (code == lastCode && (t - lastCodeMs) < DEBOUNCE_MS)
   {
     lastCodeMs = t;
+    // 同一动作键的紧凑重发（App 一帧里塞几组）也算"还按着"，
+    // 否则看门狗会把按住误判成松手，车会一顿一顿地停。
+    if (lastCodeMapped) { lastCommandMs = t; }
     return;
   }
   lastCode   = code;
@@ -656,7 +922,25 @@ void handleFrame()
     Serial.print(F("   duty="));
     Serial.println(KEY_TABLE[i].duty);
 #endif
-    setWheels(KEY_TABLE[i].leftWheel, KEY_TABLE[i].rightWheel, KEY_TABLE[i].duty);
+    lastCodeMapped = true;
+
+    // 按住期间的帧间隔 → 自动定阈值。moving 是"这一帧之前"在不在走。
+    const uint32_t gap = t - lastCommandMs;
+    if (moving) { noteFrameGap(gap); }
+  #if DEBUG_SERIAL
+    if (moving && gap < 2000)
+    {
+      Serial.print(F("[帧] 间隔=")); Serial.print(gap);
+      Serial.print(F("ms  阈值="));  Serial.print(deadmanMs);
+      Serial.println(F("ms"));
+    }
+  #endif
+
+    // 单边转弯（恰好一只轮子为 STOP）用运行时可调的 turnDuty；其余用表里的值
+    const int8_t  lw = KEY_TABLE[i].leftWheel;
+    const int8_t  rw = KEY_TABLE[i].rightWheel;
+    const bool  isTurn = ((lw == DIR_STOP) != (rw == DIR_STOP));
+    setWheels(lw, rw, isTurn ? turnDuty : KEY_TABLE[i].duty);
     return;
   }
 
@@ -666,6 +950,7 @@ void handleFrame()
   Serial.print(code, HEX);
   Serial.println(F("  （本测试程序只有七个动作键）"));
 #endif
+  lastCodeMapped = false;
   pulseLed();
 }
 
@@ -674,6 +959,8 @@ void handleFrame()
  * -------------------------------------------------------------------------*/
 void loop()
 {
+  serviceSerial();        // 串口调参：L250 / R248 / W 存盘 / D 恢复默认
+
   if (irrecv.decode(&results))
   {
     handleFrame();
