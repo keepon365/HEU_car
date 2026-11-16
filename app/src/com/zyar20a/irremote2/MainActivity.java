@@ -76,6 +76,14 @@ public class MainActivity extends Activity
     private WheelPad pad;
     private TextView pill;
     private TextView logView;
+    private TextView banner;              // 更新提示条，默认隐藏
+
+    /* ---- 自更新状态 ---- */
+    private int     upCode      = 0;      // 发现的新版 versionCode
+    private String  upName      = "";
+    private String  upBase      = null;   // 命中的更新源
+    private boolean upDownloaded = false; // 包已落盘、校验通过
+    private boolean upBusy       = false; // 正在下载，防止连点
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ArrayList<String> logs = new ArrayList<String>();
@@ -135,7 +143,10 @@ public class MainActivity extends Activity
         else if (!hasIr) { log("系统说没有发射管，仍会尝试发射，结果写在下面"); }
         log("就绪 · " + carrierHz + " Hz · 按下 " + FRAMES_FIRST + " 帧 / 维持 "
             + FRAMES_KEEP + " 帧 / 停车 " + FRAMES_STOP + " 帧");
-        log("v2.1 高位先发（bit31→bit0）· 帧间隔 " + FRAME_GAP_MS + "ms");
+        log("v2.2 高位先发（bit31→bit0）· 帧间隔 " + FRAME_GAP_MS + "ms");
+
+        // 后台查更新：没网/镜像挂了都只是安静跳过，不影响遥控
+        startUpdateCheck();
     }
 
     @Override
@@ -152,6 +163,83 @@ public class MainActivity extends Activity
         if (tx != null) { tx.removeCallbacksAndMessages(null); }
         if (txThread != null) { txThread.quitSafely(); }
         super.onDestroy();
+    }
+
+    /* ================= 自更新 ================= */
+
+    /** 更新提示条的统一出口：文案 + 可点性 + 颜色 */
+    private void setBanner(String text, boolean clickable, int color)
+    {
+        if (banner == null) { return; }
+        banner.setText(text);
+        banner.setTextColor(color);
+        banner.setVisibility(View.VISIBLE);
+        banner.setClickable(clickable);
+        banner.setAlpha(clickable ? 1f : 0.7f);
+    }
+
+    private void startUpdateCheck()
+    {
+        Updater.check(this, updateCb);
+    }
+
+    private final Updater.Cb updateCb = new Updater.Cb()
+    {
+        @Override public void onFound(int code, String name, String note, String base)
+        {
+            upCode = code;
+            upName = name;
+            upBase = base;
+            final String label = (name != null && name.length() > 0) ? ("v" + name) : ("#" + code);
+            setBanner("↑  发现新版 " + label + " · 点此更新", true, C_ACCENT);
+            log("↑ 发现新版 " + label + "（" + code + "）");
+        }
+
+        @Override public void onProgress(int pct)
+        {
+            setBanner("↓  下载中 " + pct + "%", false, C_DIM);
+        }
+
+        @Override public void onDone()
+        {
+            upDownloaded = true;
+            upBusy = false;
+            setBanner("✓  下载完成 · 点此安装", true, C_ACCENT);
+            log("✓ 更新包已就绪（" + upName + "），点横幅安装");
+            // 立刻尝试拉起安装器；缺权限时 Updater 会跳系统设置页
+            if (!Updater.install(MainActivity.this)) {
+                setBanner("→  允许「安装未知应用」后，再点这里", true, C_ACCENT);
+                log("需要允许安装未知应用：设置 → 应用 → 本应用 → 安装未知应用");
+            }
+        }
+
+        @Override public void onFail(String why)
+        {
+            upDownloaded = false;
+            upBusy = false;
+            setBanner("✗  更新失败 · 点此重试", true, C_DANGER);
+            log("✗ 更新失败 " + why);
+        }
+    };
+
+    private void onBannerTap()
+    {
+        if (upBase == null) { return; }
+
+        // 包已在本地：通常是刚被引导去开权限，回来再点一次直接装，不再走网络
+        if (upDownloaded || Updater.apkReady(this)) {
+            upDownloaded = true;
+            if (!Updater.install(this)) {
+                setBanner("→  允许「安装未知应用」后，再点这里", true, C_ACCENT);
+                log("请在系统设置里允许安装未知应用，然后回来再点一次横幅");
+            }
+            return;
+        }
+
+        if (upBusy) { return; }        // 连点保护
+        upBusy = true;
+        setBanner("↓  连接更新源…", false, C_DIM);
+        Updater.download(this, upBase, updateCb);
     }
 
     /* ================= 界面 ================= */
@@ -201,6 +289,22 @@ public class MainActivity extends Activity
         head.addView(pill);
         root.addView(head, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        /* ---- 更新提示条（默认隐藏，发现有新版才出现）---- */
+        banner = new TextView(this);
+        banner.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        banner.setTextColor(C_ACCENT);
+        banner.setPadding(dp(14), dp(10), dp(14), dp(10));
+        banner.setBackground(round(0x1A35E0A1, 0x5535E0A1, dp(12)));
+        banner.setGravity(Gravity.CENTER);
+        banner.setVisibility(View.GONE);
+        banner.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { onBannerTap(); }
+        });
+        LinearLayout.LayoutParams lpBanner = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lpBanner.topMargin = dp(10);
+        root.addView(banner, lpBanner);
 
         if (!hasIr) {
             pill.setTextColor(C_DANGER);

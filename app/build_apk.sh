@@ -11,13 +11,19 @@ APP="$(cd "$(dirname "$0")" && pwd)"
 B="$APP/build"
 OUT="/c/Users/zwm/Desktop/HEU_car/ZYAR20A遥控.apk"
 
+# 版本号可由外部注入（发布脚本用），不传就用 Manifest 里写的
+VCODE="${VCODE:-4}"
+VNAME="${VNAME:-2.2}"
+NOTE="${NOTE:-}"
+DIST="$(cd "$APP/.." && pwd)/dist"
+
 rm -rf "$B"
 mkdir -p "$B/classes" "$B/dex" "$B/gen"
 
 echo "[1/6] 编译资源 (aapt2 compile)"
 "$BT/aapt2.exe" compile --dir "$APP/res" -o "$B/res.zip"
 
-echo "[2/6] 链接资源与清单 (aapt2 link)"
+echo "[2/6] 链接资源与清单 (aapt2 link)  versionCode=$VCODE  versionName=$VNAME"
 "$BT/aapt2.exe" link \
   -o "$B/base.apk" \
   -I "$AJAR" \
@@ -26,6 +32,8 @@ echo "[2/6] 链接资源与清单 (aapt2 link)"
   --java "$B/gen" \
   --min-sdk-version 21 \
   --target-sdk-version 34 \
+  --version-code "$VCODE" \
+  --version-name "$VNAME" \
   --auto-add-overlay
 
 echo "[3/6] 编译 Java (javac)"
@@ -72,3 +80,30 @@ echo
 echo "=== 校验 ==="
 "$BT/apksigner.bat" verify --print-certs "$OUT" 2>&1 | head -6
 ls -l "$OUT"
+
+# ---- 生成 GitHub Release 需要的两个 asset ----
+# 文件名必须是纯 ASCII：GitHub 的 asset URL 用文件名拼路径，中文要百分号编码，
+# 手机端 URL 构造容易出错，所以一律用 app.apk / version.json。
+mkdir -p "$DIST"
+cp "$OUT" "$DIST/app.apk"
+
+python - "$DIST/version.json" "$VCODE" "$VNAME" "$NOTE" "$DIST/app.apk" <<'PY'
+import json, sys, hashlib
+path, code, name, note, apk = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+data = {
+    "versionCode": code,
+    "versionName": name,
+    "note": note,
+    "size": __import__("os").path.getsize(apk),
+    "md5": hashlib.md5(open(apk, "rb").read()).hexdigest(),
+}
+# 必须无 BOM：Android 的 org.json 遇到 \ufeff 会直接抛异常
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+print("   version.json ->", json.dumps(data, ensure_ascii=False))
+PY
+
+echo
+echo "=== 发布产物 ==="
+ls -l "$DIST"
+echo "把 dist/ 里的 app.apk 和 version.json 两个文件，作为 Release 的 asset 上传即可。"
