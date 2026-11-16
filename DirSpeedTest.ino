@@ -700,6 +700,9 @@ void setOneWheel(uint8_t pinGo, uint8_t pinBack, uint8_t pinEn,
  *       这两个动作永远淡不完，补偿会一直加着 → 持续跑偏。
  *    ③ 增益只在巡航时起作用（死区补偿已经淡出了），所以调 GAIN 不会
  *       影响起步同步；调 TRIM 也不会影响巡航直线。
+ *       ★ 这条靠 buildDuty() 里"增益也按 cmd 淡入"来保证。上一版漏了这层
+ *       淡入，GAIN 直接乘在起步段，结果右轮被压低 8 个 duty 才起转，
+ *       表现为"左轮先动、车往右斜"（2026-11-16 实测）。改这里务必保留淡入。
  * -------------------------------------------------------------------------*/
 uint8_t buildDuty(uint8_t cmd, uint8_t trim, uint16_t gain, uint8_t target)
 {
@@ -709,11 +712,13 @@ uint8_t buildDuty(uint8_t cmd, uint8_t trim, uint16_t gain, uint8_t target)
   // duty(≤295) × 400 会超出 uint16，用 16 位会溢出回绕成小值。
   uint32_t duty = cmd;
 
+  // 淡出终点 = 本次动作的目标值。倒车 96、旋转 108 都低于 120，
+  // 若终点写死 120，这两个动作永远淡不完，补偿会一直加着 → 持续跑偏。
+  const uint8_t fadeEnd = (target > COMP_FADE_START) ? target : COMP_FADE_START;
+
   // ---- ① 死区补偿 ----
   if (trim != 0)
   {
-    uint8_t fadeEnd = (target > COMP_FADE_START) ? target : COMP_FADE_START;
-
     if (cmd <= COMP_FADE_START)
     {
       duty = (uint16_t)cmd + trim;                       // 全额补
@@ -727,10 +732,42 @@ uint8_t buildDuty(uint8_t cmd, uint8_t trim, uint16_t gain, uint8_t target)
     // cmd >= fadeEnd：不补
   }
 
-  // ---- ② 增益补偿 ----
+  /* ---- ② 增益补偿 ------------------------------------------------------
+   * ★ 必须和 ① 一样按 cmd 淡入，否则就是 2026-11-16 那次"左轮先动"的元凶：
+   *
+   *   TRIM 是**加法**（cmd + 13，把左轮门槛 73 拉平到右轮的 60），
+   *   GAIN 是**乘法**（右轮 × 225/256）。
+   *   两个一起上，右轮被压低 → 右轮要更高的 cmd 才起转：
+   *       左轮 cmd ≥ 60 起转，右轮 cmd ≥ 68 起转 → 左轮早 8 个 duty，
+   *   ACCEL 300/s 下就是约 27ms，肉眼可见"左轮先转、车往右斜"。
+   *
+   *   上方注释 ③ 早就写明"增益只在巡航时起作用，调 GAIN 不会影响起步同步"，
+   *   但原实现无条件乘，根本没做这件事 —— 这里补齐：
+   *       cmd ≤ COMP_FADE_START   → 不压（g = 256），起步段只允许 TRIM 说话
+   *       cmd ≥ fadeEnd           → 全额按 GAIN 压，巡航行为完全不变
+   *       中间                    → 线性过渡，不留突变点
+   *
+   *   注意 g 可以是负数方向（gain < 256 时是压），所以用 int32_t 算。
+   * ------------------------------------------------------------------- */
   if (gain != 256)
   {
-    duty = duty * gain / 256;
+    int32_t g = (int32_t)gain;
+
+    if (cmd <= COMP_FADE_START)
+    {
+      g = 256;                                   // 起步段：不参与
+    }
+    else if (cmd < fadeEnd)
+    {
+      const int32_t span = (int32_t)fadeEnd - (int32_t)COMP_FADE_START;
+      if (span > 0)
+      {
+        g = 256 + ((int32_t)gain - 256)
+                * ((int32_t)cmd - (int32_t)COMP_FADE_START) / span;
+      }
+    }
+
+    if (g != 256 && g > 0) { duty = duty * (uint16_t)g / 256; }
   }
 
   return (duty > 255) ? 255 : (uint8_t)duty;
