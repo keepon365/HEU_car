@@ -14,18 +14,19 @@ rem  After the push, phones get the update on next launch.
 rem  No need to create a Release on the web page.
 rem
 rem  PROXY NOTE
-rem    This machine has git http.proxy = 127.0.0.1:7890 which is
-rem    usually NOT running, so a plain "git push" fails. The push
-rem    below clears it and connects directly (verified working).
+rem    This machine has git http.proxy = 127.0.0.1:7890. When that proxy IS
+rem    running, pushing through it works; connecting directly to GitHub
+rem    usually fails with "Connection was reset".
+rem    So: try the proxy first, and only fall back to direct if it fails.
 rem
 rem  IMPORTANT
 rem    repo must stay PUBLIC, otherwise both the app and every
 rem    mirror get 404.
 rem ============================================================
 
-set VCODE=4
-set VNAME=2.2
-set VNOTE=auto-update support
+set VCODE=7
+set VNAME=2.5
+set VNOTE=fix version code not baked into apk
 
 rem  %~dp0 = the folder this .bat lives in.  Double-clicking a bat sets
 rem  the working directory to System32, so we MUST cd to the script dir
@@ -48,14 +49,23 @@ if errorlevel 1 goto fail
 echo.
 echo === pushing to GitHub ===
 git add -A dist app/src app/AndroidManifest.xml app/build_apk.sh *.apk *.bat
-git -c user.name="keepon365" -c user.email="keepon365@users.noreply.github.com" commit -m "release v%VCODE% %VNAME%"
+if exist ".git\RELEASE_MSG.txt" (
+  git -c user.name="keepon365" -c user.email="keepon365@users.noreply.github.com" commit -F ".git\RELEASE_MSG.txt"
+) else (
+  git -c user.name="keepon365" -c user.email="keepon365@users.noreply.github.com" commit -m "release v%VNAME% code %VCODE%"
+)
 if errorlevel 1 echo    (nothing new to commit, continuing)
 
-set http_proxy=
-set https_proxy=
+rem  Push: proxy first (127.0.0.1:7890), direct only as fallback.
 set HTTP_PROXY=
 set HTTPS_PROXY=
-git -c http.proxy= -c https.proxy= push origin main
+set http_proxy=
+set https_proxy=
+git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push origin main
+if errorlevel 1 (
+  echo    [retry] proxy push failed, trying direct...
+  git -c http.proxy= -c https.proxy= push origin main
+)
 if errorlevel 1 goto pushfail
 
 echo.

@@ -144,4 +144,18 @@ PY
 echo
 echo "=== 发布产物 ==="
 ls -l "$DIST"
+
+# 中文提交说明：在 cmd 批处理里直接写中文会按 GBK 存进去，推上去是乱码。
+# 这里用 python 写成 UTF-8，发布.bat 用 git commit -F 引用即可。
+MSG="$(cd "$APP/.." && pwd)/.git/RELEASE_MSG.txt"
+python - "$MSG" "$VCODE" "$VNAME" "$NOTE" <<'PY'
+import sys
+path, code, name, note = sys.argv[1:5]
+with open(path, "w", encoding="utf-8", newline="\n") as f:
+    f.write("发布 v%s（versionCode %s）\n" % (name, code))
+    if note.strip():
+        f.write("\n" + note.strip() + "\n")
+print("   提交说明 -> .git/RELEASE_MSG.txt")
+PY
+
 echo "把 dist/ 里的 app.apk 和 version.json 两个文件，作为 Release 的 asset 上传即可。"

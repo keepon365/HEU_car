@@ -1,2 +1,13 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# 换行必须钉死，否则在 Windows 上检出后会被 core.autocrlf 改写：
+#   .sh 变成 CRLF  → bash 报 $'\r': command not found，构建脚本直接挂
+#   .bat 变成 LF   → cmd 的 goto / 标签解析异常
+*.sh    text eol=lf
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+*.ino   text eol=lf
+*.java  text eol=lf
+*.xml   text eol=lf
+*.json  text eol=lf
