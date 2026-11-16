@@ -1,7 +1,7 @@
 {
-  "versionCode": 5,
-  "versionName": "2.3",
-  "note": "turn via spin, fix direction",
+  "versionCode": 6,
+  "versionName": "2.4",
+  "note": "新增遛狗模式：自动追最近的移动物体，没有就扫一圈再找最近的",
   "size": 45857,
-  "md5": "1066f2d2b66fd2edba798cc8143f25fb"
+  "md5": "0211637c22eb1f6768a00550c063632a"
 }

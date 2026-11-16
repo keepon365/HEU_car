@@ -51,6 +51,10 @@ public class MainActivity extends Activity
     private static final int CODE_SPINL = 0x00FFE01F;
     private static final int CODE_SPINR = 0x00FF906F;
 
+    /** 遛狗模式：遥控器数字键 "0" 的码。车端是「按一下切换」，不是按住才跑。
+     *  它不在固件 KEY_TABLE 里，由 handleFrame() 单独识别。 */
+    private static final int CODE_DOG   = 0x00FF6897;
+
     /* ---------- 配色 ---------- */
     private static final int C_BG     = 0xFF080B10;
     private static final int C_CARD   = 0xFF141B24;
@@ -79,6 +83,12 @@ public class MainActivity extends Activity
     private TextView pill;
     private TextView logView;
     private TextView banner;              // 更新提示条，默认隐藏
+    private TextView dogBtn;              // 遛狗模式按钮
+
+    /* 遛狗模式是「按一下开、再按一下关」的切换语义。
+     * 红外是单向的，车不会回报状态，所以只能在这里自己记着 ——
+     * 一旦用户手动操作（按圆盘/停车），车端会退出遛狗，这里也必须同步清掉。 */
+    private boolean dogOn = false;
 
     /* ---- 自更新状态 ---- */
     private int     upCode      = 0;      // 发现的新版 versionCode
@@ -145,7 +155,7 @@ public class MainActivity extends Activity
         else if (!hasIr) { log("系统说没有发射管，仍会尝试发射，结果写在下面"); }
         log("就绪 · " + carrierHz + " Hz · 按下 " + FRAMES_FIRST + " 帧 / 维持 "
             + FRAMES_KEEP + " 帧 / 停车 " + FRAMES_STOP + " 帧");
-        log("v2.3 圆盘左右 = 原地转向 · 帧间隔 " + FRAME_GAP_MS + "ms");
+        log("v2.4 圆盘左右 = 原地转向 · 新增遛狗模式 · 帧间隔 " + FRAME_GAP_MS + "ms");
 
         // 后台查更新：没网/镜像挂了都只是安静跳过，不影响遥控
         startUpdateCheck();
@@ -154,6 +164,15 @@ public class MainActivity extends Activity
     @Override
     protected void onPause()
     {
+        /* 遛狗模式是车自己在跑，退到后台必须显式叫停。
+         * 红外是单向的，App 一关就没法再发指令，只能等车端 60 秒硬超时 ——
+         * 那期间车会一直追着东西跑，太危险。 */
+        if (dogOn) {
+            fire(CODE_STOP, "退出遛狗", true, FRAMES_STOP);
+            dogOn = false;
+            renderDogBtn();
+            log("遛狗：App 退到后台，已叫停");
+        }
         release();                       // 退到后台一定先刹车
         super.onPause();
     }
@@ -340,6 +359,27 @@ public class MainActivity extends Activity
            直接发旋转键码，功能重合，删掉整排，把纵向空间留给圆盘。
            键码常量 CODE_SPINL / CODE_SPINR 仍然保留在上面。 */
 
+        /* ---- 遛狗模式 ----
+           车端逻辑：启动后自己扫一圈，去追离得最近的「会动的东西」；
+           没有会动的，就在扫到的目标里挑最近的过去。
+           它是切换式，所以这里只要发一帧，接下来车自己跑。 */
+        dogBtn = new TextView(this);
+        dogBtn.setGravity(Gravity.CENTER);
+        dogBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f);
+        dogBtn.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        dogBtn.setPadding(0, dp(13), 0, dp(13));
+        dogBtn.setClickable(true);
+        dogBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { toggleDog(); }
+        });
+        renderDogBtn();
+
+        LinearLayout.LayoutParams lpDog = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lpDog.topMargin = dp(10);
+        root.addView(dogBtn, lpDog);
+
         /* ---- 日志 ---- */
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -391,7 +431,7 @@ public class MainActivity extends Activity
 
         /* ---- 底部说明 ---- */
         TextView foot = new TextView(this);
-        foot.setText("连发 " + REPEAT_MS + " ms  ·  松手立即刹车  ·  原地旋转需固件支持");
+        foot.setText("连发 " + REPEAT_MS + " ms  ·  松手立即刹车  ·  遛狗中按任意方向键即接管");
         foot.setTextColor(0xFF4F5B69);
         foot.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
         foot.setGravity(Gravity.CENTER);
@@ -474,6 +514,39 @@ public class MainActivity extends Activity
         }
     }
 
+    /* ================= 遛狗模式 ================= */
+
+    private void renderDogBtn()
+    {
+        if (dogBtn == null) { return; }
+
+        if (dogOn) {
+            dogBtn.setText("●  遛狗中 · 点此停止");
+            dogBtn.setTextColor(0xFF06210F);
+            dogBtn.setBackground(round(C_ACCENT, C_ACCENT, dp(14)));
+        } else {
+            dogBtn.setText("遛狗模式  ·  自动追最近的移动物体");
+            dogBtn.setTextColor(C_ACCENT);
+            dogBtn.setBackground(round(0x1435E0A1, 0x5535E0A1, dp(14)));
+        }
+    }
+
+    private void toggleDog()
+    {
+        if (ir == null) { log("✗ 没有红外服务，无法启动"); return; }
+
+        dogOn = !dogOn;
+        renderDogBtn();
+        buzz(dogOn ? 35 : 15);
+
+        /* 只发一轮两帧就够：车端有 120ms 去重，第二帧会被吃掉，不会把它又切回去。
+         * 千万别像方向键那样持续重发 —— 那是「切换」语义，重发等于来回开关。 */
+        fire(CODE_DOG, dogOn ? "遛狗模式 开" : "遛狗模式 关", true, FRAMES_FIRST);
+
+        log(dogOn ? "遛狗：先追会动的东西；没有就扫一圈，再去找最近的"
+                  : "遛狗：已停止");
+    }
+
     private void press(int code, String name, boolean needsStop)
     {
         if (ir == null) {
@@ -481,6 +554,14 @@ public class MainActivity extends Activity
             return;
         }
         if (activeCode == code && needsStop) { return; }   // 同一动作重复按下不重发
+
+        /* 手动接管：车端收到任何动作键都会退出遛狗模式并执行该动作，
+         * 这里同步把按钮状态清掉，否则界面会一直显示"遛狗中"但车其实早就不听了。 */
+        if (dogOn && code != CODE_DOG) {
+            dogOn = false;
+            renderDogBtn();
+            log("遛狗：手动接管，已退出");
+        }
 
         activeCode      = code;
         activeName      = name;
