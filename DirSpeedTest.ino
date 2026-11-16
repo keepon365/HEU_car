@@ -216,11 +216,12 @@
 #define DUTY_BACK          96   // 后退：比基准再慢 20%
                                 //   如果倒车"哼哼不转"，把它提到和 DUTY_BASE 一样
 #define DUTY_SPIN         108   // 原地旋转：基准的 90%（左右同值，转得圆）
-#define DUTY_TURN          65   // 左转 / 右转：只驱动外侧轮时的占空比
-                                //   内侧轮是"断电自由滚动"（不是刹车），转弯半径由轮距决定，
-                                //   所以这个值只决定**转得多快**：调小 = 点一下转的角度小。
-                                //   下限约 80：再低要克服内侧轮拖滑阻力 + 左轮起转门槛（73），
-                                //   会出现"按了不转、松手才动"。
+#define DUTY_TURN          85   // 左转 / 右转：只驱动外侧轮时的占空比
+                                //   ⚠️ 原值 65 是个 bug：乘全局速度后只有 72，
+                                //   低于左轮起转门槛 73，所以「按了完全没反应」。
+                                //   现在 App 已把所有转向交给原地旋转，这个键只剩
+                                //   旧版 App（v2.2 及以前）还在发，提到 85 让它至少能动。
+                                //   85×1.1 = 94，够克服内侧轮拖滑，又不会太冲。
                                 //   ⚠️ 左转靠右轮（门槛 60）、右转靠左轮（门槛 73），
                                 //   同一个值下右转会略慢于左转，这是正常的。
 
@@ -392,8 +393,11 @@ const KeyAction KEY_TABLE[] =
   { 0x00FF22DDUL, "<<   左转",  DIR_STOP,     DIR_FORWARD,  DUTY_TURN },
   { 0x00FFC23DUL, ">||  右转",  DIR_FORWARD,  DIR_STOP,     DUTY_TURN },
   { 0x00FF02FDUL, ">>|  停车",  DIR_STOP,     DIR_STOP,     0         },
-  { 0x00FFE01FUL, "-    左旋",  DIR_BACKWARD, DIR_FORWARD,  DUTY_SPIN },
-  { 0x00FF906FUL, "EQ   右旋",  DIR_FORWARD,  DIR_BACKWARD, DUTY_SPIN },
+  // 这两个键承担整车的转向功能（App 圆盘左右即映射到这里）。
+  // 方向按实车实测反相过一次：上一版按"左"实际往右偏，故左右轮对调。
+  // 若将来换电机接线，这里要再翻一次 —— 只改这两行，其余不用动。
+  { 0x00FFE01FUL, "-    左转",  DIR_FORWARD,  DIR_BACKWARD, DUTY_SPIN },
+  { 0x00FF906FUL, "EQ   右转",  DIR_BACKWARD, DIR_FORWARD,  DUTY_SPIN },
 };
 const uint8_t KEY_COUNT = sizeof(KEY_TABLE) / sizeof(KEY_TABLE[0]);
 

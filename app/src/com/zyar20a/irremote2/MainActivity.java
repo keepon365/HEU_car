@@ -43,8 +43,10 @@ public class MainActivity extends Activity
     /* ---------- 键码：必须与固件 KEY_TABLE 一致 ---------- */
     private static final int CODE_FWD   = 0x00FF629D;
     private static final int CODE_BACK  = 0x00FFA857;
-    private static final int CODE_LEFT  = 0x00FF22DD;
-    private static final int CODE_RIGHT = 0x00FFC23D;
+    private static final int CODE_LEFT  = 0x00FF22DD;   // 单边左转：已废弃，圆盘改发 SPINL
+    private static final int CODE_RIGHT = 0x00FFC23D;   // 单边右转：已废弃，圆盘改发 SPINR
+                                                        // （保留定义，因为固件仍认识这两个码，
+                                                        //   方便以后想恢复"行进中转向"时直接用）
     private static final int CODE_STOP  = 0x00FF02FD;
     private static final int CODE_SPINL = 0x00FFE01F;
     private static final int CODE_SPINR = 0x00FF906F;
@@ -143,7 +145,7 @@ public class MainActivity extends Activity
         else if (!hasIr) { log("系统说没有发射管，仍会尝试发射，结果写在下面"); }
         log("就绪 · " + carrierHz + " Hz · 按下 " + FRAMES_FIRST + " 帧 / 维持 "
             + FRAMES_KEEP + " 帧 / 停车 " + FRAMES_STOP + " 帧");
-        log("v2.2 高位先发（bit31→bit0）· 帧间隔 " + FRAME_GAP_MS + "ms");
+        log("v2.3 圆盘左右 = 原地转向 · 帧间隔 " + FRAME_GAP_MS + "ms");
 
         // 后台查更新：没网/镜像挂了都只是安静跳过，不影响遥控
         startUpdateCheck();
@@ -333,22 +335,10 @@ public class MainActivity extends Activity
         root.addView(padHolder, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        /* ---- 原地旋转 ---- */
-        LinearLayout spinRow = new LinearLayout(this);
-        spinRow.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams lpSpin = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lpSpin.topMargin = dp(10);
-
-        TextView spinL = makeHoldButton("⟲  原地左旋", CODE_SPINL, "原地左旋");
-        TextView spinR = makeHoldButton("原地右旋  ⟳", CODE_SPINR, "原地右旋");
-
-        LinearLayout.LayoutParams halfA = new LinearLayout.LayoutParams(0, dp(52), 1f);
-        LinearLayout.LayoutParams halfB = new LinearLayout.LayoutParams(0, dp(52), 1f);
-        halfB.leftMargin = dp(10);
-        spinRow.addView(spinL, halfA);
-        spinRow.addView(spinR, halfB);
-        root.addView(spinRow, lpSpin);
+        /* ---- 转向已并入圆盘左右 ----
+           原来这里有一排「原地左旋 / 原地右旋」长按按钮。现在圆盘的左右
+           直接发旋转键码，功能重合，删掉整排，把纵向空间留给圆盘。
+           键码常量 CODE_SPINL / CODE_SPINR 仍然保留在上面。 */
 
         /* ---- 日志 ---- */
         LinearLayout card = new LinearLayout(this);
@@ -412,6 +402,8 @@ public class MainActivity extends Activity
         return root;
     }
 
+    /** 长按即持续发、松手即停的按钮。当前界面未使用（转向已并入圆盘），
+     *  留作以后加功能键的现成模板 —— 删掉也不影响编译。 */
     private TextView makeHoldButton(String label, final int code, final String name)
     {
         TextView tv = new TextView(this);
@@ -833,8 +825,12 @@ public class MainActivity extends Activity
                 switch (z) {
                     case Z_UP:    listener.onMove(CODE_FWD,   "前进"); break;
                     case Z_DOWN:  listener.onMove(CODE_BACK,  "后退"); break;
-                    case Z_LEFT:  listener.onMove(CODE_LEFT,  "左转"); break;
-                    case Z_RIGHT: listener.onMove(CODE_RIGHT, "右转"); break;
+                    // 左右两个方向改为发"原地旋转"键码。
+                    // 原来发的是单边转弯码（CODE_LEFT / CODE_RIGHT），
+                    // 但那个动作在实车上根本推不动（占空比低于起转门槛），
+                    // 而原地旋转转得干净、半径小，用户实测效果更好，故取而代之。
+                    case Z_LEFT:  listener.onMove(CODE_SPINL, "左转"); break;
+                    case Z_RIGHT: listener.onMove(CODE_SPINR, "右转"); break;
                     case Z_STOP:  listener.onStop(); break;
                     case Z_NONE:
                         // 抬手由 onTouchEvent 统一处理，这里不重复触发
