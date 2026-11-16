@@ -11,9 +11,10 @@ APP="$(cd "$(dirname "$0")" && pwd)"
 B="$APP/build"
 OUT="/c/Users/zwm/Desktop/HEU_car/ZYAR20A遥控.apk"
 
-# 版本号可由外部注入（发布脚本用），不传就用 Manifest 里写的
-VCODE="${VCODE:-4}"
-VNAME="${VNAME:-2.2}"
+# 版本号可由外部注入（发布脚本用），不传就用这里的默认值
+# ★ 每次发版把这两个默认值一起改掉，免得手动构建时打出旧号
+VCODE="${VCODE:-7}"
+VNAME="${VNAME:-2.5}"
 NOTE="${NOTE:-}"
 DIST="$(cd "$APP/.." && pwd)/dist"
 
@@ -24,10 +25,35 @@ echo "[1/6] 编译资源 (aapt2 compile)"
 "$BT/aapt2.exe" compile --dir "$APP/res" -o "$B/res.zip"
 
 echo "[2/6] 链接资源与清单 (aapt2 link)  versionCode=$VCODE  versionName=$VNAME"
+
+# ★ aapt2 的 --version-code / --version-name 只在清单「缺少该属性」时才注入。
+#   清单里写死 android:versionCode 的话，命令行参数会被完全忽略，打出来的包
+#   还是旧版本号，而 version.json 却按新号写 —— 手机就永远提示同一个版本、
+#   装完还是旧的。2026-11-16 踩过这个坑（发了 2.4，APK 里实际是 5/2.3）。
+#   所以这里生成一份临时清单，把两个属性替换成实际值，别再依赖 aapt2 的注入。
+MANIFEST_TMP="$B/AndroidManifest.xml"
+python - "$APP/AndroidManifest.xml" "$MANIFEST_TMP" "$VCODE" "$VNAME" <<'PY'
+import re, sys
+src, dst, code, name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(src, encoding="utf-8") as f:
+    t = f.read()
+if re.search(r'android:versionCode\s*=', t):
+    t = re.sub(r'android:versionCode\s*=\s*"\d+"', 'android:versionCode="%s"' % code, t, count=1)
+else:
+    t = t.replace('<manifest ', '<manifest android:versionCode="%s" ' % code, 1)
+if re.search(r'android:versionName\s*=', t):
+    t = re.sub(r'android:versionName\s*=\s*"[^"]*"', 'android:versionName="%s"' % name, t, count=1)
+else:
+    t = t.replace('<manifest ', '<manifest android:versionName="%s" ' % name, 1)
+with open(dst, "w", encoding="utf-8", newline="\n") as f:
+    f.write(t)
+print("   临时清单已写入 versionCode=%s versionName=%s" % (code, name))
+PY
+
 "$BT/aapt2.exe" link \
   -o "$B/base.apk" \
   -I "$AJAR" \
-  --manifest "$APP/AndroidManifest.xml" \
+  --manifest "$MANIFEST_TMP" \
   -R "$B/res.zip" \
   --java "$B/gen" \
   --min-sdk-version 21 \
@@ -80,6 +106,18 @@ echo
 echo "=== 校验 ==="
 "$BT/apksigner.bat" verify --print-certs "$OUT" 2>&1 | head -6
 ls -l "$OUT"
+
+# ★ 硬校验：装进手机的那个号，必须和我们要发的号一致。不一致就直接失败，
+#   绝不生成 version.json —— 否则又会出现"提示有新版本、装完还是旧的"死循环。
+BADGE="$("$BT/aapt2.exe" dump badging "$OUT" 2>/dev/null | head -1)"
+echo "$BADGE"
+case "$BADGE" in
+  *"versionCode='$VCODE'"*"versionName='$VNAME'"*)
+    echo "   [OK] 清单版本号与发布号一致" ;;
+  *)
+    echo "!! APK 清单里的版本号与 VCODE=$VCODE / VNAME=$VNAME 不一致，已中止发布"
+    exit 1 ;;
+esac
 
 # ---- 生成 GitHub Release 需要的两个 asset ----
 # 文件名必须是纯 ASCII：GitHub 的 asset URL 用文件名拼路径，中文要百分号编码，

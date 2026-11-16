@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.zyar20a.irremote2"
-    android:versionCode="5"
-    android:versionName="2.3">
+    android:versionCode="7"
+    android:versionName="2.5">
 
     <uses-permission android:name="android.permission.TRANSMIT_IR" />
     <uses-permission android:name="android.permission.VIBRATE" />
