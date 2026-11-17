@@ -339,6 +339,9 @@
 #define RACE_GO_MS         400   // 比赛：一次前进至多多久（约 20cm，短步多确认）
 #define RACE_CONFIRM_MS    120   // 对准后回中、等多久再测正前方
 #define RACE_CONFIRM_SLACK  20   // 正前方实测允许比目标远多少 cm 才算「确认到了」
+#define RACE_CONFIRM_NEAR_CM 20  // ★ 只有这么近的目标才强制"回中实测正前方"。
+                                 //   远目标偏 15° 以内直接走：走一段还能再修，
+                                 //   每次都回中确认太慢，远景偏 15° 物块仍在视野里。
 
 /* ---- 微调专用：慢速 + 起转补偿 + 没动就加倍 ----
  * ★ 为什么微调要单独降速：
@@ -348,10 +351,13 @@
  *   用 78 的占空比把转速降到约 150°/s，30° 要 200ms，起转占比降到 30%，
  *   线性度好得多。大角度转向仍用 DUTY_SPIN，不影响。 */
 #define DUTY_AIM            78   // 微调占空比（比 DUTY_SPIN 的 119 慢很多）
-#define AIM_DPS            150   // DUTY_AIM 下的角速度，需实测标定（串口 Q）
+#define AIM_DPS            390   // DUTY_AIM(78→实际 86) 下的实测角速度（2026-11-17）
+                                 //   标定方法：Q 转 1 秒，实测"一圈多 30°" = 390°/s
+                                 //   串口 Q 可在线上改，改完记得回填这里
 #define TURN_COMP_MS        50   // 起转补偿：只加在 ≤45° 的微调上
 #define AIM_GROW_NUM        18   // 没转够时脉冲放大 1.8 倍 = 18/10
 #define AIM_GROW_DEN        10
+#define Q_CALIB_MS        1000   // Q 标定时转多久（1 秒更好数圈）
                                  //   别太长：车没有编码器，走越久偏得越多。
                                  //   1100ms 走完立刻回扫描重新对准，这就是"多测测"。
 #define RACE_PUSH_CM        8    // 比赛：贴到这个距离就开始"多推一段"
@@ -835,6 +841,11 @@ extern bool dogOn;
 extern uint8_t dogMode;
 extern uint16_t turnDps;                                 // 运行时旋转角速度（度/秒）
 extern uint16_t aimDps;                                  // 微调角速度（Q 标定用）
+extern uint8_t  aimDuty;                                 // 微调占空比（A 可在线改）
+extern uint8_t  beaconPhase;                             // Q 标定借用它绕开加速曲线
+extern uint32_t beaconUntil;
+uint32_t nowMs();
+void applyOutput();
 void setWheels(int8_t left, int8_t right, uint8_t duty);  // Q 标定要直接驱动电机
 void brakeCar();
 void     dogServoWrite(uint8_t deg);                     // 云台（C 命令要用）
@@ -938,6 +949,18 @@ void handleSerialCmd()
       if (dogOn) { dogStop("串口命令"); } else { dogStart(MODE_DOG); }
       return;
 
+    /* A<占空比> = 改微调占空比（试到"能转的最小值"，越小越容易控制精度）
+     *   78 太慢转不动就试 A95 / A110 */
+    case 'A':
+      if (v >= 40 && v <= 200)
+      {
+        aimDuty = (uint8_t)v;
+        Serial.print(F("[AIM] 微调占空比 = "));
+        Serial.println(aimDuty);
+      }
+      else { Serial.println(F("[AIM] 用法 A<40~200>，例 A95")); }
+      return;
+
     /* Q = 微调速率标定（DUTY_AIM 下的角速度，和大角度转向是两个数）
      *   Q      → 用微调占空比左转 3 秒，数圈数 X
      *   Q<dps> → 写入，例：3 圈就发 Q360（3×360/3=360） */
@@ -951,11 +974,42 @@ void handleSerialCmd()
       }
       else
       {
-        Serial.println(F("[AIM] 微调占空比左转 3 秒，数圈数 X，然后发 Q<X*120>"));
-        setWheels(DIR_FORWARD, DIR_BACKWARD, DUTY_AIM);
-        delay(3000);
+        Serial.print(F("[AIM] 微调占空比左转 "));
+        Serial.print(Q_CALIB_MS);
+        Serial.println(F(" 毫秒，数圈数 X，然后发 Q<X*360*1000/Q_CALIB_MS>"));
+
+        /* ★ 必须临时把 beaconPhase 置位，否则 setWheels 会走 rampedDuty：
+         *   duty 78 被"按住加速"的起点压到 46，低于左轮门槛 73、右轮门槛 60，
+         *   而 delay(3000) 期间又不跑 serviceRamp()，于是全程一动不动
+         *   —— 第一次发 Q 时"转了个 P 没转"就是这个原因（2026-11-17）。
+         *   beaconPhase 非 0 时 setWheels 走"直给"分支，正好绕开曲线。 */
+        beaconPhase = 1;
+        beaconUntil = nowMs() + 4000;
+        setWheels(DIR_FORWARD, DIR_BACKWARD, aimDuty);
+
+        /* ★ 关键：setWheels 只设 targetDuty，真正输出用的是 currentDuty，
+         *   而 currentDuty 是由 serviceRamp() 每拍往上爬的。
+         *   delay(3000) 把主循环堵死，serviceRamp 一次都不跑 →
+         *   currentDuty 永远停在 0 → 电机根本没通电。
+         *   （前两次"转了个 P 没转"就是这个：第一次还叠加了加速曲线把
+         *     78 压到 46 的问题，改完曲线后仍然不动，就是因为这个。）
+         *   这里直接把 currentDuty 顶到位再输出一次。 */
+        currentDuty = targetDuty;
+        applyOutput();
+
+        Serial.print(F("[AIM] 实际 duty="));
+        Serial.print(currentDuty);
+        Serial.print(F("  左轮门槛 73 / 右轮门槛 60，低于它就不会动"));
+        Serial.println();
+
+        delay(Q_CALIB_MS);
         brakeCar();
-        Serial.println(F("[AIM] 停。圈数 X -> Q<X*120>"));
+        beaconPhase = 0;
+        beaconUntil = 0;
+
+        Serial.print(F("[AIM] 停。圈数 X -> 发 Q<"));
+        Serial.print((uint32_t)360 * 1000UL / Q_CALIB_MS);
+        Serial.println(F("*X>  （X=圈数）"));
       }
       return;
 
@@ -1140,6 +1194,7 @@ uint16_t dogQuickRefCm = 0;           // 这一段结束时的距离（DOG_QUICK
 int8_t   aimLastIdx = -1;             // 上次微调时目标的档位
 uint16_t aimLastCm  = 0;              // 上次微调时的距离
 uint16_t aimDps     = AIM_DPS;        // 微调角速度（串口 Q 可标定）
+uint8_t  aimDuty    = DUTY_AIM;       // 微调占空比（串口 A 可改，试到能转的最小值）
 // angleReversed 定义在上面（串口命令要先用到它）
 
 uint8_t  dogPhase      = 0;           // 阶段常量见下面 DOG_IDLE 等
@@ -2011,6 +2066,18 @@ void raceDecide(uint32_t t)
   if (mag <= RACE_DEAD_DEG || raceAimCount >= RACE_AIM_MAX)
   {
     raceAimCount = 0;
+
+    /* 按距离分级（用户 2026-11-17 定）：
+     *   远目标（>20cm）：75~105° 内直接走。远距离偏 15° 时物块仍在正前方
+     *                    视野里，走一段还能再修；每次都回中确认太慢。
+     *   近目标（≤20cm）：必须回中实测。这时候差一点角度就真的擦肩而过，
+     *                    而且超声盲区就在眼前，斜着读到的值很不可靠。 */
+    if (dogTargetCm > RACE_CONFIRM_NEAR_CM)
+    {
+      dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
+      return;
+    }
+
     dogServoWrite(90);
     dogPhase   = DOG_CONFIRM;
     dogPhaseMs = t;
@@ -2075,7 +2142,7 @@ void dogTurn(uint32_t ms, int8_t side, uint8_t after)
 /* 小角度微调：低速（DUTY_AIM），让短脉冲也有时间起转 */
 void aimTurn(uint32_t ms, int8_t side, uint8_t after)
 {
-  dogTurnEx(ms, side, after, DUTY_AIM);
+  dogTurnEx(ms, side, after, aimDuty);
 }
 
 /* 前进一段。舵机必须先回中，否则测的不是车要走的那条路。 */
