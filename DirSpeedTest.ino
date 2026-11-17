@@ -558,6 +558,7 @@ const uint8_t SERVO_N      = sizeof(SERVO_PINS) / sizeof(SERVO_PINS[0]);
  *  音序非阻塞：按下标推进，主循环每拍调 serviceBuzzer() 翻电平 / 换音。
  *  代价是别处阻塞时音会抖（pulseIn 最长 25ms），提示音都很短，听感可接受。
  * =========================================================================*/
+uint32_t nowMs();          // 定义在文件后半部分，先声明（按键/音乐要用）
 const uint8_t PIN_BUZZ = A3;
 
 struct BuzzStep { uint16_t freq; uint16_t ms; };   // freq = 0 表示静音段
@@ -613,6 +614,94 @@ void buzzStop()
 }
 
 /* 每拍调用：换段 / 翻转电平 */
+/* ===========================================================================
+ *  《植物大战僵尸》Grasswalk 主旋律（蜂鸣器单音版）
+ * ---------------------------------------------------------------------------
+ *  搜到的谱子带了 C#/A# 这些变化音，和原曲调性对得上，不是随便编的。
+ *  蜂鸣器只能发单音，所以只取主旋律、去掉和声与伴奏。
+ *
+ *  音名 -> 频率（Hz）：C#5=554  D5=587  A#4=466  G4=392  A4=440
+ *                      D4=294  C#4=277  G5=784  F5=698  D#5=622
+ *                      F#4=370  C5=523
+ *  每个音 130ms（约十六分音符 @115BPM），整段约 15 秒，播完自动循环。
+ * =========================================================================*/
+#define MUS_C5   523
+#define MUS_CS4  277
+#define MUS_D4   294
+#define MUS_DS5  622
+#define MUS_F5   698
+#define MUS_FS4  370
+#define MUS_G4   392
+#define MUS_G5   784
+#define MUS_A4   440
+#define MUS_AS4  466
+#define MUS_CS5  554
+#define MUS_D5   587
+
+#define MT 130          // 单个音时长（ms）
+
+const BuzzStep MUSIC_PVZ[] = {
+  // 主题动机 ×3
+  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
+  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
+  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
+  // 上行句
+  {MUS_A4,MT},{MUS_AS4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D4,MT},{MUS_CS4,MT},{MUS_D4,MT},
+  {MUS_G4,MT},{MUS_AS4,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_G5,MT},{MUS_AS4,MT},
+  // 主题动机
+  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
+  // 长句 ×2
+  {MUS_A4,MT},{MUS_AS4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D4,MT},{MUS_CS4,MT},{MUS_D4,MT},
+  {MUS_G4,MT},{MUS_AS4,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_G5,MT},{MUS_AS4,MT},
+  {MUS_G5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_F5,MT},{MUS_DS5,MT},{MUS_D5,MT},
+  {MUS_A4,MT},{MUS_FS4,MT},{MUS_A4,MT},{MUS_DS5,MT},{MUS_D5,MT},
+  {MUS_A4,MT},{MUS_AS4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D4,MT},{MUS_CS4,MT},{MUS_D4,MT},
+  {MUS_G4,MT},{MUS_AS4,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_G5,MT},{MUS_AS4,MT},
+  {MUS_G5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_F5,MT},{MUS_DS5,MT},{MUS_D5,MT},
+  {MUS_A4,MT},{MUS_FS4,MT},{MUS_A4,MT},{MUS_DS5,MT},{MUS_D5,MT},
+  // 收尾
+  {MUS_D5,MT},{MUS_DS5,MT},{MUS_D5,MT},{MUS_DS5,MT},{MUS_D5,MT},{MUS_C5,MT},{MUS_AS4,MT},
+  {MUS_FS4,MT},{MUS_G4,MT},{MUS_G4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_D5,MT*2}
+};
+#define PVZ_N (uint8_t)(sizeof(MUSIC_PVZ) / sizeof(MUSIC_PVZ[0]))
+
+/* ---- S1 按键：扩展板「按键电路」，网络名 key，接 A2 ----
+ * 接法：一端 GND，另一端 A2 并经 4.7k 上拉到 5V → 用 INPUT_PULLUP，
+ * 不按为 HIGH，按下为 LOW。
+ * ★ A2 是从原理图推出来的：beep→A3、红外→A4、超声→A0/A1，
+ *   剩下的模拟口只有 A2。若按了没反应，串口发 N 看哪一路在变。
+ * -----------------------------------------------------------------------*/
+const uint8_t PIN_KEY = A2;
+bool musicOn   = false;
+bool keyLast   = true;
+uint32_t keyScanMs = 0;
+
+void serviceMusic()
+{
+  /* 循环播放：一段放完（buzzSeq 归 0）就重头来 */
+  if (musicOn && buzzSeq == 0) { buzzPlay(MUSIC_PVZ, PVZ_N); }
+}
+
+void serviceKey()
+{
+  if ((uint32_t)(nowMs() - keyScanMs) < 20) { return; }
+  keyScanMs = nowMs();
+
+  const bool raw = (digitalRead(PIN_KEY) == HIGH);   // HIGH = 没按
+  if (raw == keyLast) { return; }
+  keyLast = raw;
+
+  if (raw) { return; }               // 只处理"按下"这一下
+
+  musicOn = !musicOn;
+  if (musicOn) { buzzPlay(MUSIC_PVZ, PVZ_N); }
+  else         { buzzStop(); }
+
+#if DEBUG_SERIAL
+  Serial.println(musicOn ? F("[S1] 音乐 开") : F("[S1] 音乐 关"));
+#endif
+}
+
 void serviceBuzzer()
 {
   if (buzzSeq == 0) { return; }
@@ -951,6 +1040,24 @@ void handleSerialCmd()
      * 和按遥控器上的数字键 0 完全等价。 */
     case 'G':
       if (dogOn) { dogStop("串口命令"); } else { dogStart(MODE_DOG); }
+      return;
+
+    /* M = 音乐开关（S1 按钮同效）；M0 强制停止
+     * N = 打印候选按键脚电平（排查 S1 到底接在哪个脚） */
+    case 'M':
+      if (v == 0) { musicOn = false; buzzStop(); Serial.println(F("[S1] 音乐 关")); }
+      else
+      {
+        musicOn = !musicOn;
+        if (musicOn) { buzzPlay(MUSIC_PVZ, PVZ_N); Serial.println(F("[S1] 音乐 开")); }
+        else         { buzzStop(); Serial.println(F("[S1] 音乐 关")); }
+      }
+      return;
+
+    case 'N':
+      Serial.print(F("[PIN] A2=")); Serial.print(digitalRead(A2));
+      Serial.print(F("  A5="));     Serial.print(digitalRead(A5));
+      Serial.println(F("   （不按应为 1，按下变 0）"));
       return;
 
     /* A<占空比> = 改微调占空比（试到"能转的最小值"，越小越容易控制精度）
@@ -1360,6 +1467,9 @@ void setup()
    * ★ 不能用 tone()：它占 Timer2，而 IRremote 也用 Timer2，一响红外就废。 */
   pinMode(PIN_BUZZ, OUTPUT);
   digitalWrite(PIN_BUZZ, LOW);
+
+  /* S1 按键：内部上拉，不按为 HIGH，按下为 LOW */
+  pinMode(PIN_KEY, INPUT_PULLUP);
 
   brakeCar();          // 上电先确保电机停着
   irrecv.enableIRIn(); // 红外接收开始（占用 Timer2，与 Timer0 的 PWM 互不影响）
@@ -2222,6 +2332,7 @@ void serviceBeacon()
 void dogStart(uint8_t mode)
 {
   beaconCancel();                 // 万一上一条提示还没转完
+  musicOn = false;                // 进入自动模式先停音乐，否则提示音一直被打断
   buzzStop();
 
   dogMode         = mode;
@@ -2802,7 +2913,10 @@ void loop()
   }
 
   /* 蜂鸣器每拍都要服务：它是软件方波，靠主循环翻转电平。
-   * 放在最前面，保证提示音不被后面的逻辑拖慢。 */
+   * 放在最前面，保证提示音不被后面的逻辑拖慢。
+   * 音乐循环与 S1 按键也在这里维护。 */
+  serviceKey();
+  serviceMusic();
   serviceBuzzer();
 
 #if DOG_ENABLED
