@@ -315,7 +315,28 @@
 #define MODE_DOG           1
 #define MODE_RACE          2
 
-#define RACE_GO_MS       1100    // 比赛：一次前进多久
+/* ---- 比赛模式：用户 2026-11-17 定的流程 ----
+ *  搜索：本轮扫描里有没有 ≤RACE_MAX_CM 的东西？没有就逆时针转 90° 再扫，
+ *        连转 RACE_SEARCH_MAX 次还没有 → 报警（0.5s 响 3 次，间隔 0.3s）
+ *  对准：目标不在 75~105° 就按偏角微调，微调后重新全扫；微调 RACE_AIM_MAX 次
+ *        还没对准就强制前进（再僵着没有意义，走一步视角就变了）
+ *  推进：每次至多 RACE_GO_MS(1s)，走完回"对准"
+ *  收集：本轮最小距离曾 ≤RACE_NEAR_CM，之后回升 ≥RACE_RISE_CM → 判定收进底盘
+ *
+ * ★ RACE_NEAR_CM 为什么是 25 而不是 12（用户原方案写 12cm）：
+ *   物块只有 5cm 高、探头装在车头约 10cm，12cm 距离上波束中心还在 11.6cm，
+ *   声波从物块头顶飞过去 —— 12cm 这个读数基本拿不到，"曾接近 12cm"会永远
+ *   不成立，于是每轮都被判成"跟丢"，车会在原地反复追一个看不见的东西。
+ *   25cm 是有回波就能确认"我确实追上过"的稳妥值。 */
+#define RACE_MAX_CM        80    // 只把 80cm 内的东西当目标
+#define RACE_NEAR_CM       25    // 本轮最小距离 ≤ 它 = 确实追上过
+#define RACE_RISE_CM        8    // 之后回升这么多 = 物块进底盘了
+#define RACE_SEARCH_TURN_DEG 90  // 搜索时每次逆时针转多少度（用 90° 而不是 0.5s：
+                                 //   0.5s≈145°，配 ±60° 视野会留 25° 缺口漏掉小方块）
+#define RACE_SEARCH_MAX      8   // 连转几次还没找到就报警
+#define RACE_AIM_MAX         4   // 对准最多微调几次
+#define RACE_DEAD_DEG       15   // 偏角 ≤ 它就当已对准（75~105° 容差）
+#define RACE_GO_MS        1000   // 比赛：一次前进至多多久
                                  //   别太长：车没有编码器，走越久偏得越多。
                                  //   1100ms 走完立刻回扫描重新对准，这就是"多测测"。
 #define RACE_PUSH_CM        8    // 比赛：贴到这个距离就开始"多推一段"
@@ -520,10 +541,13 @@ struct BuzzStep { uint16_t freq; uint16_t ms; };   // freq = 0 表示静音段
 const BuzzStep SEQ_START[] = { { 1000, 90 }, { 1500, 130 } };
 const BuzzStep SEQ_STOP[]  = { { 520, 240 } };
 const BuzzStep SEQ_PICK[]  = { { 1600, 60 }, { 0, 35 }, { 1600, 60 }, { 0, 35 }, { 2000, 100 } };
+/* 找不到目标时的报警：响 0.5s、停 0.3s，共三次 */
+const BuzzStep SEQ_ALARM[] = { { 1800, 500 }, { 0, 300 }, { 1800, 500 }, { 0, 300 }, { 1800, 500 } };
 
 #define SEQ_START_N  (uint8_t)(sizeof(SEQ_START) / sizeof(SEQ_START[0]))
 #define SEQ_STOP_N   (uint8_t)(sizeof(SEQ_STOP)  / sizeof(SEQ_STOP[0]))
 #define SEQ_PICK_N   (uint8_t)(sizeof(SEQ_PICK)  / sizeof(SEQ_PICK[0]))
+#define SEQ_ALARM_N  (uint8_t)(sizeof(SEQ_ALARM) / sizeof(SEQ_ALARM[0]))
 
 const BuzzStep *buzzSeq     = 0;
 uint8_t  buzzLen     = 0;
@@ -1058,6 +1082,12 @@ uint8_t  dogSmpOk      = 0;           // 本档有效读数个数
 bool     dogOn         = false;
 uint8_t  dogMode       = 0;           // 0=关  1=MODE_DOG 遛狗  2=MODE_RACE 比赛
 bool     dogPushDone   = false;       // 比赛模式：这一段的「多推」是否已经加过
+
+/* ---- 比赛模式的搜索/对准/收集状态 ---- */
+bool     raceSearching = true;        // true = 正在「找目标」，false = 已锁定一个目标在追
+uint16_t raceBestCm    = 0;           // 本轮追踪中出现过的最小距离（0 = 还没有）
+uint8_t  raceMissCount = 0;           // 连续「这一圈没有 80cm 内目标」的次数
+uint8_t  raceAimCount  = 0;           // 本轮对准已经微调了几次
 // angleReversed 定义在上面（串口命令要先用到它）
 
 uint8_t  dogPhase      = 0;           // 阶段常量见下面 DOG_IDLE 等
@@ -1110,6 +1140,7 @@ void     dogTurn(uint32_t ms, int8_t side, uint8_t after);
 void     dogGo(uint32_t ms);
 void     dogStart(uint8_t mode);
 void     dogStop(const char *why, bool withBeacon);
+void     raceDecide(uint32_t t);
 void     beaconCancel();
 void     serviceBeacon();
 void     serviceDog();
@@ -1753,6 +1784,108 @@ uint32_t turnMsFor(uint16_t deg)
 
 uint32_t dogTurn180Ms() { return turnMsFor(180); }
 
+/* ===========================================================================
+ *  比赛模式决策 —— 每次扫描完（DOG_PICK）调用一次，必须总是安排好下一阶段
+ * ---------------------------------------------------------------------------
+ *  用户 2026-11-17 定的流程：
+ *    ① 搜索：本轮有没有 ≤80cm 的东西？没有 → 逆时针转 90° 再扫，
+ *            连转 8 次仍没有 → 报警（响 0.5s 停 0.3s，共三次）
+ *    ② 对准：目标不在 75~105° → 按偏角微调 → 重新扫描；微调 4 次仍不对准就强制前进
+ *    ③ 推进：至多 1 秒（贴到 8cm 之后再多推 1.2s 把物块兜进底盘）
+ *    ④ 收集：本轮最小距离曾 ≤25cm，之后回升 ≥8cm → 判定收进底盘
+ * =========================================================================*/
+void raceDecide(uint32_t t)
+{
+  (void)t;
+
+  /* ---------- ① 这一轮有没有 80cm 内的目标 ---------- */
+  if (dogTargetIdx < 0 || dogTargetCm > RACE_MAX_CM)
+  {
+    raceSearching = true;
+    if (raceMissCount < 255) { raceMissCount++; }
+
+    if (raceMissCount >= RACE_SEARCH_MAX)
+    {
+      raceMissCount = 0;                    // 报完警重新数，继续找（不停死）
+      buzzPlay(SEQ_ALARM, SEQ_ALARM_N);
+    #if DEBUG_SERIAL
+      Serial.println(F("[RACE] 连转 8 次仍无 80cm 内目标 -> 报警"));
+    #endif
+    }
+
+    dogStreak = 0;
+    /* 逆时针（side = -1）转 90°。用 90° 而不是 0.5s：
+     * 0.5s≈145°，配 ±60° 视野会留 25° 缺口，小方块正好落进去就漏了。 */
+    dogTurn(turnMsFor(RACE_SEARCH_TURN_DEG), -1, DOG_SCAN);
+    return;
+  }
+
+  /* ---------- ② 刚锁定目标：建立本轮的距离基准 ---------- */
+  if (raceSearching)
+  {
+    raceSearching = false;
+    raceBestCm    = dogTargetCm;
+    raceMissCount = 0;
+    raceAimCount  = 0;
+  #if DEBUG_SERIAL
+    Serial.print(F("[RACE] 锁定 "));
+    Serial.print(scanAngles[dogTargetIdx]);
+    Serial.print(F(" 度 "));
+    Serial.print(dogTargetCm);
+    Serial.println(F("cm"));
+  #endif
+  }
+
+  /* ---------- ③ 收集判定 ----------
+   * 必须「曾接近过」才认回升，否则车只是走歪、目标滑出视野时距离同样会变大，
+   * 那会被误判成"收到了"，然后白白回搜索转一圈。 */
+  if (raceBestCm > 0 && raceBestCm <= RACE_NEAR_CM &&
+      dogTargetCm >= (uint16_t)(raceBestCm + RACE_RISE_CM))
+  {
+  #if DEBUG_SERIAL
+    Serial.print(F("[RACE] 收集成功：最近 "));
+    Serial.print(raceBestCm);
+    Serial.print(F("cm -> 现在 "));
+    Serial.print(dogTargetCm);
+    Serial.println(F("cm"));
+  #endif
+    raceBestCm    = 0;
+    raceSearching = true;
+    raceAimCount  = 0;
+
+    buzzPlay(SEQ_PICK, SEQ_PICK_N);
+    dogServoWrite(90);
+    dogTurn(dogTurn180Ms(), +1, DOG_SCAN);   // 换相反方向继续找
+    return;
+  }
+
+  if (raceBestCm == 0 || dogTargetCm < raceBestCm) { raceBestCm = dogTargetCm; }
+
+  /* ---------- ④ 对准 ---------- */
+  const int16_t off = (int16_t)scanAngles[dogTargetIdx] - 90;
+  const int16_t mag = (off < 0) ? (int16_t)(-off) : off;
+
+  /* 已在 ±15° 内（75~105°），或者微调次数用完了 → 前进。
+   * 微调用完还硬转没意义：走一步视角就变了，通常比原地死磕更快对上。 */
+  if (mag <= RACE_DEAD_DEG || raceAimCount >= RACE_AIM_MAX)
+  {
+    raceAimCount = 0;
+    dogGo(RACE_GO_MS);
+    return;
+  }
+
+  raceAimCount++;
+
+  int8_t side = (off < 0) ? (int8_t)-1 : (int8_t)+1;
+  if (angleReversed) { side = (int8_t)(-side); }
+
+  uint32_t ms = (uint32_t)mag * 1000UL / (uint32_t)(turnDps ? turnDps : 1);
+  if (ms < DOG_TURN_MIN_MS) { ms = DOG_TURN_MIN_MS; }
+  if (ms > DOG_TURN_MAX_MS) { ms = DOG_TURN_MAX_MS; }
+
+  dogTurn(ms, side, DOG_SCAN);   // 转完重新全扫，再回 PICK 判定
+}
+
 /* 原地旋转。after 决定转完去哪儿（对准目标 → DOG_GO；找目标 → DOG_SCAN）。
  * 用 DUTY_SPIN，和 App 圆盘左右是同一个动作、同一个占空比，走起来手感一致。 */
 void dogTurn(uint32_t ms, int8_t side, uint8_t after)
@@ -1887,6 +2020,12 @@ void dogStart(uint8_t mode)
   dogTargetMoving = false;
   dogTargetCm     = 0;
 
+  /* 比赛模式的搜索/对准/收集状态复位 */
+  raceSearching = true;
+  raceBestCm    = 0;
+  raceMissCount = 0;
+  raceAimCount  = 0;
+
   /* 按模式选扫描表：比赛 9 档 15°（物块小，要对准），遛狗 5 档 30°（要快）。 */
   if (mode == MODE_RACE)
   {
@@ -1917,14 +2056,18 @@ void dogStart(uint8_t mode)
   Serial.print(scaleSpeed((uint8_t)((uint16_t)DUTY_BASE * DOG_FWD_PCT / 100)));
   if (mode == MODE_RACE)
   {
-    Serial.print(F("  贴近 "));
-    Serial.print(RACE_PUSH_CM);
-    Serial.print(F("cm 后多推 "));
-    Serial.print(RACE_OVERRUN_MS);
-    Serial.print(F("ms，然后 180 度换向"));
+    Serial.print(F("  只认 "));
+    Serial.print(RACE_MAX_CM);
+    Serial.print(F("cm 内；找 8 次报警；对准 4 次；每次走 "));
+    Serial.print(RACE_GO_MS);
+    Serial.println(F("ms"));
     Serial.print(F("  扫描 "));
     Serial.print(scanN);
-    Serial.println(F(" 档 / 15 度"));
+    Serial.print(F(" 档 / 15 度   贴近 "));
+    Serial.print(RACE_PUSH_CM);
+    Serial.print(F("cm 多推 "));
+    Serial.print(RACE_OVERRUN_MS);
+    Serial.println(F("ms"));
   }
   else
   {
@@ -2053,24 +2196,13 @@ void serviceDog()
 
       if (dogLost >= DOG_LOST_MAX) { dogStop("探头无回波"); return; }
 
+      /* ---- 比赛模式：搜索 → 对准 → 推进 → 收集判定，全套在 raceDecide 里 ---- */
+      if (dogMode == MODE_RACE) { raceDecide(t); return; }
+
       if (dogTargetIdx < 0)
       {
-        dogStreak = 0;
-
-        /* ★ 比赛模式：这一圈什么都没有 → **直走**，不要原地转。
-         *   原来固定右转 420ms，空场时会一直顺时针打转（用户看到的"只会右转"
-         *   有一半来自这里）。空场本来就该往前开去碰运气。 */
-        if (dogMode == MODE_RACE)
-        {
-          dogAfter = DOG_SCAN;
-          dogGo(RACE_GO_MS);
-        #if DEBUG_SERIAL
-          Serial.println(F("[RACE] 空场，直走一段再扫"));
-        #endif
-          break;
-        }
-
         // 遛狗：没有目标时转开一段再找（追人的场景不适合盲目前冲）
+        dogStreak = 0;
         dogTurn(DOG_ESCAPE_MS, +1, DOG_SCAN);
         break;
       }
@@ -2146,11 +2278,12 @@ void serviceDog()
          * 响一声告诉人"收了一个"，同时原地转 180° 换到相反方向继续找。
          * 蜂鸣是非阻塞的，转向期间正好播完。 */
         buzzPlay(SEQ_PICK, SEQ_PICK_N);
+        raceBestCm    = 0;          // 换方向了，距离基准作废
+        raceSearching = true;
+        raceAimCount  = 0;
         dogIdx = 0;
         dogTurn(dogTurn180Ms(), +1, DOG_SCAN);
-      #if DEBUG_SERIAL
-        Serial.println(F("[RACE] 收集完成：蜂鸣 + 180 度换向"));
-      #endif
+
       }
       else
       {
@@ -2212,8 +2345,8 @@ void serviceDog()
         dogPhase = DOG_PAUSE;
         dogPhaseMs = t;
       #if DEBUG_SERIAL
-        Serial.println(dogPushDone ? F("[RACE] 收集完成，准备 180 度换向")
-                                   : F("[RACE] 这段没碰到东西，回扫描重新选最近"));
+        if (dogPushDone) { Serial.println(F("[RACE] 推满，刹车等停稳再掉头")); }
+        else             { Serial.println(F("[RACE] 走满 1s，回扫描确认方向")); }
       #endif
         break;
       }
