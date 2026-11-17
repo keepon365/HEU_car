@@ -334,9 +334,24 @@
 #define RACE_SEARCH_TURN_DEG 90  // 搜索时每次逆时针转多少度（用 90° 而不是 0.5s：
                                  //   0.5s≈145°，配 ±60° 视野会留 25° 缺口漏掉小方块）
 #define RACE_SEARCH_MAX      8   // 连转几次还没找到就报警
-#define RACE_AIM_MAX         4   // 对准最多微调几次
+#define RACE_AIM_MAX         6   // 对准最多微调几次（配合"没动就加倍"，6 次很宽裕）
 #define RACE_DEAD_DEG       15   // 偏角 ≤ 它就当已对准（75~105° 容差）
-#define RACE_GO_MS        1000   // 比赛：一次前进至多多久
+#define RACE_GO_MS         400   // 比赛：一次前进至多多久（约 20cm，短步多确认）
+#define RACE_CONFIRM_MS    120   // 对准后回中、等多久再测正前方
+#define RACE_CONFIRM_SLACK  20   // 正前方实测允许比目标远多少 cm 才算「确认到了」
+
+/* ---- 微调专用：慢速 + 起转补偿 + 没动就加倍 ----
+ * ★ 为什么微调要单独降速：
+ *   290°/s 是按「2800ms 转 2.2 圈」标出来的**稳态**速度。
+ *   微调只给 103ms（30°），里面前约 60ms 都在克服静摩擦、加速，
+ *   真正匀速转的只有 40ms —— 实际只转出 12° 左右。
+ *   用 78 的占空比把转速降到约 150°/s，30° 要 200ms，起转占比降到 30%，
+ *   线性度好得多。大角度转向仍用 DUTY_SPIN，不影响。 */
+#define DUTY_AIM            78   // 微调占空比（比 DUTY_SPIN 的 119 慢很多）
+#define AIM_DPS            150   // DUTY_AIM 下的角速度，需实测标定（串口 Q）
+#define TURN_COMP_MS        50   // 起转补偿：只加在 ≤45° 的微调上
+#define AIM_GROW_NUM        18   // 没转够时脉冲放大 1.8 倍 = 18/10
+#define AIM_GROW_DEN        10
                                  //   别太长：车没有编码器，走越久偏得越多。
                                  //   1100ms 走完立刻回扫描重新对准，这就是"多测测"。
 #define RACE_PUSH_CM        8    // 比赛：贴到这个距离就开始"多推一段"
@@ -819,6 +834,9 @@ uint8_t scaleSpeed(uint8_t duty)
 extern bool dogOn;
 extern uint8_t dogMode;
 extern uint16_t turnDps;                                 // 运行时旋转角速度（度/秒）
+extern uint16_t aimDps;                                  // 微调角速度（Q 标定用）
+void setWheels(int8_t left, int8_t right, uint8_t duty);  // Q 标定要直接驱动电机
+void brakeCar();
 void     dogServoWrite(uint8_t deg);                     // 云台（C 命令要用）
 uint32_t beaconOneTurnMs();
 void spinFor(int8_t side, uint32_t ms);
@@ -918,6 +936,27 @@ void handleSerialCmd()
      * 和按遥控器上的数字键 0 完全等价。 */
     case 'G':
       if (dogOn) { dogStop("串口命令"); } else { dogStart(MODE_DOG); }
+      return;
+
+    /* Q = 微调速率标定（DUTY_AIM 下的角速度，和大角度转向是两个数）
+     *   Q      → 用微调占空比左转 3 秒，数圈数 X
+     *   Q<dps> → 写入，例：3 圈就发 Q360（3×360/3=360） */
+    case 'Q':
+      if (v > 0)
+      {
+        aimDps = (uint16_t)v;
+        Serial.print(F("[AIM] 微调角速度 = "));
+        Serial.print(aimDps);
+        Serial.println(F(" deg/s"));
+      }
+      else
+      {
+        Serial.println(F("[AIM] 微调占空比左转 3 秒，数圈数 X，然后发 Q<X*120>"));
+        setWheels(DIR_FORWARD, DIR_BACKWARD, DUTY_AIM);
+        delay(3000);
+        brakeCar();
+        Serial.println(F("[AIM] 停。圈数 X -> Q<X*120>"));
+      }
       return;
 
     /* B = 蜂鸣器自检。B 三声（收集音） / B1 启动音 / B2 结束音
@@ -1088,6 +1127,19 @@ bool     raceSearching = true;        // true = 正在「找目标」，false = 
 uint16_t raceBestCm    = 0;           // 本轮追踪中出现过的最小距离（0 = 还没有）
 uint8_t  raceMissCount = 0;           // 连续「这一圈没有 80cm 内目标」的次数
 uint8_t  raceAimCount  = 0;           // 本轮对准已经微调了几次
+
+/* 增量逼近：上一次微调后目标还在同一档、距离也没近，说明压根没转够，
+ * 下一次把脉冲放大 1.8 倍。这样不依赖精确标定也能收敛。 */
+/* GO 途中的"距离不再变小"检测：连续几次没接近就提前刹车，
+ * 不等走满 400ms —— 走歪时这一段是纯浪费，还容易从物块旁边擦过去。 */
+uint16_t dogLastCm     = 0;           // GO 中上次测到的前方距离
+uint8_t  dogNoDown     = 0;           // 连续几次没有变近
+uint16_t dogQuickRefCm = 0;           // 这一段结束时的距离（DOG_QUICK 的基准）
+#define RACE_STALL_N 3                // 连续几次不变近就提前结束
+
+int8_t   aimLastIdx = -1;             // 上次微调时目标的档位
+uint16_t aimLastCm  = 0;              // 上次微调时的距离
+uint16_t aimDps     = AIM_DPS;        // 微调角速度（串口 Q 可标定）
 // angleReversed 定义在上面（串口命令要先用到它）
 
 uint8_t  dogPhase      = 0;           // 阶段常量见下面 DOG_IDLE 等
@@ -1148,6 +1200,9 @@ void     dogGo(uint32_t ms);
 void     dogStart(uint8_t mode);
 void     dogStop(const char *why, bool withBeacon);
 void     raceDecide(uint32_t t);
+void     aimTurn(uint32_t ms, int8_t side, uint8_t after);
+uint16_t effCm(uint16_t d, int16_t mag);
+uint32_t aimMsFor(int16_t mag);
 void     beaconCancel();
 void     serviceBeacon();
 void     serviceDog();
@@ -1215,6 +1270,9 @@ void setup()
   Serial.print (F("   比赛扫描 "));
   Serial.print (F("9 档/15 度  遛狗 5 档/30 度"));
   Serial.print (F("   左右判定="));  Serial.println(angleReversed ? F("反向(角度小=左)") : F("正向(角度大=右)"));
+  Serial.print (F("   微调角速度=")); Serial.print(aimDps);
+  Serial.print (F(" deg/s（占空比 ")); Serial.print(DUTY_AIM);
+  Serial.println(F("）串口 Q 标定"));
   Serial.print (F("   旋转角速度=")); Serial.print(turnDps);
   Serial.print (F(" deg/s（一圈 ")); Serial.print(beaconOneTurnMs());
   Serial.println(F("ms）  串口 U<K值> 调，K 试一圈"));
@@ -1692,6 +1750,8 @@ uint32_t nowMs()
 #define DOG_GO     6   // 前进中
 #define DOG_BEACON 7   // 启动提示：正在播放启动音，播完才开始扫描（不再转圈）
 #define DOG_TURN_AWAY 8  // 只给 dogAfter 用：停稳后转 180° 换方向，不是真实阶段
+#define DOG_CONFIRM 10  // 对准后回中，实测一次正前方再决定走不走
+#define DOG_QUICK   11  // 走完一段，快速测一发：还在接近就继续走，否则重扫
 #define DOG_TURN_AROUND 9 // 只给 dogAfter 用：比赛模式收集完成，停稳后响一声 + 转 180°
                           //   ★ 必须和 DOG_SCAN 分开，否则 PAUSE 分不清
                           //   "刚走完要换向" 和 "刚转完该扫描"，会死循环原地转。
@@ -1791,6 +1851,41 @@ uint32_t turnMsFor(uint16_t deg)
 
 uint32_t dogTurn180Ms() { return turnMsFor(180); }
 
+/* ---------------------------------------------------------------------------
+ *  偏角折算：把「斜距」换算成「正前方等效距离」
+ * ---------------------------------------------------------------------------
+ *  目标偏离正前方 θ 角时，超声波读到的是斜距 d/cosθ —— 车只是走歪了
+ *  （目标还在视野里），距离也会凭空变大：
+ *      20cm 的目标偏到 45°，读数是 28.3cm（+8.3cm）
+ *  刚好超过"回升 8cm = 收进底盘"的阈值，于是走歪被误判成收到了。
+ *  所以判定必须在同一个尺度上比：两边都折算回正前方。
+ * -------------------------------------------------------------------------*/
+const uint16_t COS1000[5] = { 1000, 966, 866, 707, 500 };
+
+uint16_t cos1000(int16_t mag)
+{
+  if (mag <= 0)  { return 1000; }
+  if (mag >= 60) { return 500;  }
+  return COS1000[(mag + 7) / 15];      // 四舍五入到最近的 15°
+}
+
+uint16_t effCm(uint16_t d, int16_t mag)
+{
+  return (uint16_t)((uint32_t)d * cos1000(mag) / 1000UL);
+}
+
+/* 微调时长：按 AIM_DPS 换算，再补起转延迟。
+ * 补偿会让大角度略过转，所以只对 ≤45° 生效。 */
+uint32_t aimMsFor(int16_t mag)
+{
+  const uint16_t dps = aimDps ? aimDps : AIM_DPS;
+  uint32_t ms = (uint32_t)mag * 1000UL / (uint32_t)dps;
+  if (mag <= 45) { ms += TURN_COMP_MS; }
+  if (ms < 60)  { ms = 60;  }
+  if (ms > 600) { ms = 600; }
+  return ms;
+}
+
 /* ===========================================================================
  *  比赛模式决策 —— 每次扫描完（DOG_PICK）调用一次，必须总是安排好下一阶段
  * ---------------------------------------------------------------------------
@@ -1868,17 +1963,28 @@ void raceDecide(uint32_t t)
   }
 
   /* ---------- ③ 收集判定 ----------
-   * 必须「曾接近过」才认回升，否则车只是走歪、目标滑出视野时距离同样会变大，
-   * 那会被误判成"收到了"，然后白白回搜索转一圈。 */
+   * ★ 必须用「折算到正前方的等效距离」来比，不能直接用原始读数：
+   *   目标偏 θ 角时读到的是斜距 d/cosθ，车只是走歪了距离也会变大
+   *   （20cm 的目标偏到 45° 就读成 28.3cm，凭空多 8.3cm，正好越过阈值）。
+   *   两边都折算回正前方，才不会把"走歪"误判成"收到了"。
+   * 另外必须「曾接近过」，否则刚开始追就判收集。 */
+  const int16_t offNow = (int16_t)scanAngles[dogTargetIdx] - 90;
+  const int16_t magNow = (offNow < 0) ? (int16_t)(-offNow) : offNow;
+  const uint16_t effNow = effCm(dogTargetCm, magNow);
+
   if (raceBestCm > 0 && raceBestCm <= RACE_NEAR_CM &&
-      dogTargetCm >= (uint16_t)(raceBestCm + RACE_RISE_CM))
+      effNow >= (uint16_t)(raceBestCm + RACE_RISE_CM))
   {
   #if DEBUG_SERIAL
     Serial.print(F("[RACE] 收集成功：最近 "));
     Serial.print(raceBestCm);
     Serial.print(F("cm -> 现在 "));
     Serial.print(dogTargetCm);
-    Serial.println(F("cm"));
+    Serial.print(F("cm("));
+    Serial.print(magNow);
+    Serial.print(F("度, 折算 "));
+    Serial.print(effNow);
+    Serial.println(F("cm)"));
   #endif
     raceBestCm    = 0;
     raceSearching = true;
@@ -1890,7 +1996,7 @@ void raceDecide(uint32_t t)
     return;
   }
 
-  if (raceBestCm == 0 || dogTargetCm < raceBestCm) { raceBestCm = dogTargetCm; }
+  if (raceBestCm == 0 || effNow < raceBestCm) { raceBestCm = effNow; }
 
   /* ---------- ④ 对准 ---------- */
   const int16_t off = (int16_t)scanAngles[dogTargetIdx] - 90;
@@ -1898,10 +2004,16 @@ void raceDecide(uint32_t t)
 
   /* 已在 ±15° 内（75~105°），或者微调次数用完了 → 前进。
    * 微调用完还硬转没意义：走一步视角就变了，通常比原地死磕更快对上。 */
+  /* 已在 ±15° 内，或者微调次数用完 → 进入"正前方确认"。
+   * ★ 不直接走：目标在 105° 档（偏 15°）时，斜着能看到不代表正前方有它。
+   *   超声波锥角约 15°，偏 15° 的目标正好在视野边缘，车直着开过去
+   *   很容易从它旁边擦过。所以必须回中实测一发再决定。 */
   if (mag <= RACE_DEAD_DEG || raceAimCount >= RACE_AIM_MAX)
   {
     raceAimCount = 0;
-    dogGo(RACE_GO_MS);
+    dogServoWrite(90);
+    dogPhase   = DOG_CONFIRM;
+    dogPhaseMs = t;
     return;
   }
 
@@ -1910,32 +2022,60 @@ void raceDecide(uint32_t t)
   int8_t side = (off < 0) ? (int8_t)-1 : (int8_t)+1;
   if (angleReversed) { side = (int8_t)(-side); }
 
-  uint32_t ms = (uint32_t)mag * 1000UL / (uint32_t)(turnDps ? turnDps : 1);
-  if (ms < DOG_TURN_MIN_MS) { ms = DOG_TURN_MIN_MS; }
-  if (ms > DOG_TURN_MAX_MS) { ms = DOG_TURN_MAX_MS; }
+  uint32_t ms = aimMsFor(mag);
 
-  dogTurn(ms, side, DOG_SCAN);   // 转完重新全扫，再回 PICK 判定
+  /* ---- 增量逼近：没转够就加倍 ----
+   * 上一次微调之后，目标还停在同一档、距离也没变近 → 那一下几乎没转
+   * （短脉冲全被静摩擦吃掉）。这一次把脉冲放大 1.8 倍。
+   * 这比反复标定可靠：电池电压、地面摩擦随时在变，标定值一定会漂。 */
+  if (aimLastIdx >= 0 && dogTargetIdx == aimLastIdx && aimLastCm > 0 &&
+      (uint16_t)(dogTargetCm + 3) >= aimLastCm)
+  {
+    ms = (uint32_t)ms * AIM_GROW_NUM / AIM_GROW_DEN;
+    if (ms > 700) { ms = 700; }
+  #if DEBUG_SERIAL
+    Serial.println(F("[RACE] 上一轮没转够，脉冲加倍"));
+  #endif
+  }
+  aimLastIdx = dogTargetIdx;
+  aimLastCm  = dogTargetCm;
+
+  aimTurn(ms, side, DOG_SCAN);   // 低速微调，转完重新全扫，再回 PICK 判定
 }
 
 /* 原地旋转。after 决定转完去哪儿（对准目标 → DOG_GO；找目标 → DOG_SCAN）。
  * 用 DUTY_SPIN，和 App 圆盘左右是同一个动作、同一个占空比，走起来手感一致。 */
-void dogTurn(uint32_t ms, int8_t side, uint8_t after)
+void dogTurnEx(uint32_t ms, int8_t side, uint8_t after, uint8_t duty)
 {
   dogHoldMs  = ms;
   dogAfter   = after;
   dogPhaseMs = nowMs();
   dogPhase   = DOG_TURN;
 
-  if (side < 0) { setWheels(DIR_FORWARD,  DIR_BACKWARD, DUTY_SPIN); }
-  else          { setWheels(DIR_BACKWARD, DIR_FORWARD,  DUTY_SPIN); }
+  if (side < 0) { setWheels(DIR_FORWARD,  DIR_BACKWARD, duty); }
+  else          { setWheels(DIR_BACKWARD, DIR_FORWARD,  duty); }
 
 #if DEBUG_SERIAL
   Serial.print(F("[DOG] 转向 "));
-  Serial.print(side < 0 ? F("左") : F("右"));
+  Serial.print(side < 0 ? F("左 L") : F("右 R"));
   Serial.print(' ');
   Serial.print(ms);
-  Serial.println(F("ms"));
+  Serial.print(F("ms"));
+  if (duty != DUTY_SPIN) { Serial.print(F(" 微调低速")); }
+  Serial.println();
 #endif
+}
+
+/* 大角度转向：仍用 DUTY_SPIN（快） */
+void dogTurn(uint32_t ms, int8_t side, uint8_t after)
+{
+  dogTurnEx(ms, side, after, DUTY_SPIN);
+}
+
+/* 小角度微调：低速（DUTY_AIM），让短脉冲也有时间起转 */
+void aimTurn(uint32_t ms, int8_t side, uint8_t after)
+{
+  dogTurnEx(ms, side, after, DUTY_AIM);
 }
 
 /* 前进一段。舵机必须先回中，否则测的不是车要走的那条路。 */
@@ -1946,6 +2086,8 @@ void dogGo(uint32_t ms)
   if (dogPhase != DOG_GO) { dogGoStartMs = nowMs(); }
 
   dogPushDone = false;              // 每段重新计"多推"是否已触发
+  dogLastCm   = 0;                  // 距离趋势检测复位
+  dogNoDown   = 0;
   dogHoldMs   = ms;
   dogPhaseMs = nowMs();
   dogCheckMs = nowMs();
@@ -2295,6 +2437,77 @@ void serviceDog()
       break;
     }
 
+    // ---- 对准之后：回中实测正前方，确认目标真的在车头方向 ------------------
+    case DOG_CONFIRM:
+    {
+      if ((uint32_t)(t - dogPhaseMs) < RACE_CONFIRM_MS) { break; }
+
+      const uint16_t d = dogMeasure();
+
+      /* 通过条件：正前方确实有东西、在 80cm 内、且不比刚才扫描到的目标远太多。
+       * 斜前方的目标在正前方常常读不到，或者读到一个远得多的值 ——
+       * 这正是"从物块旁边擦过去"的根源。 */
+      const bool ok = (d != 0) && (d <= RACE_MAX_CM) &&
+                      (d <= (uint16_t)(dogTargetCm + RACE_CONFIRM_SLACK));
+
+      if (ok)
+      {
+        if (raceBestCm == 0 || d < raceBestCm) { raceBestCm = d; }
+      #if DEBUG_SERIAL
+        Serial.print(F("[RACE] 正前方确认 OK "));
+        Serial.print(d);
+        Serial.println(F("cm"));
+      #endif
+        dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
+        break;
+      }
+
+    #if DEBUG_SERIAL
+      Serial.print(F("[RACE] 正前方确认失败 d="));
+      Serial.print(d);
+      Serial.println(F(" -> 重扫"));
+    #endif
+      aimLastIdx = -1;                 // 基准变了，增量复位
+
+      if (raceAimCount >= RACE_AIM_MAX)
+      {
+        raceAimCount = 0;
+        dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
+      }
+      else
+      {
+        raceAimCount++;
+        dogIdx     = 0;
+        scanFwd    = !scanFwd;
+        dogPhase   = DOG_SCAN;
+        dogPhaseMs = t;
+      }
+      break;
+    }
+
+    // ---- 走完一段：快速测一发，决定继续走还是重扫 --------------------------
+    case DOG_QUICK:
+    {
+      if ((uint32_t)(t - dogPhaseMs) < 60) { break; }
+
+      const uint16_t d = dogMeasure();
+
+      /* 还在稳定接近（比这段刚结束时又近了 3cm 以上）且没到 8cm → 再来一段。
+       * 正常前进就是"走 400ms + 测 60ms"的循环，只有真出问题才付一次 1.4 秒全扫。 */
+      if (d != 0 && d > RACE_PUSH_CM && (uint16_t)(d + 3) <= dogQuickRefCm)
+      {
+        if (raceBestCm == 0 || d < raceBestCm) { raceBestCm = d; }
+        dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
+        break;
+      }
+
+      dogIdx     = 0;
+      scanFwd    = !scanFwd;
+      dogPhase   = DOG_SCAN;
+      dogPhaseMs = t;
+      break;
+    }
+
     // ---- 旋转中 ----------------------------------------------------------
     case DOG_TURN:
       if ((uint32_t)(t - dogPhaseMs) >= dogHoldMs)
@@ -2359,6 +2572,16 @@ void serviceDog()
           if (d != 0)
           {
             dogFrontCm = d;
+
+            /* 距离不再变小 → 走歪了，或者正在从物块旁边擦过去。
+             * 提前结束这一段比走满 400ms 再发现要好。 */
+            if (dogLastCm > 0 && (uint16_t)(d + 2) >= dogLastCm)
+            {
+              if (dogNoDown < 255) { dogNoDown++; }
+            }
+            else { dogNoDown = 0; }
+            dogLastCm = d;
+
             if (d <= RACE_PUSH_CM && !dogPushDone)
             {
               dogPushDone = true;
@@ -2371,6 +2594,18 @@ void serviceDog()
               Serial.println(F("ms 把物块兜进底盘"));
             #endif
             }
+            else if (!dogPushDone && dogNoDown >= RACE_STALL_N && d < 45)
+            {
+              /* ★ 必须排除"正在推"的情况：推物块时距离本来就不变，
+               *   不排除的话 overrun 的 1200ms 会在 150ms 内被判"不再变小"
+               *   直接腰斩，物块根本推不进去（2026-11-17 实测踩到）。 */
+              dogHoldMs = 0;                      // 立刻结束这一段
+            #if DEBUG_SERIAL
+              Serial.print(F("[RACE] 距离不再变小("));
+              Serial.print(d);
+              Serial.println(F("cm)，提前结束这一段"));
+            #endif
+            }
           }
         }
 
@@ -2379,17 +2614,19 @@ void serviceDog()
         brakeCar();
         dogStreak  = 0;
 
-        /* ★ 走完一段之后往哪走（2026-11-17 改，这是"几乎不左转"的根因）：
-         *   原来固定右转 RACE_TURN_DEG(120°)，三次就是 360°，车一直在顺时针
-         *   绕圈扫场 —— 目标几乎总出现在右侧，所以看起来"从来不会左转"。
-         *   现在分两种：
-         *     · 推过东西（dogPushDone）→ 收集完成：响一声 + 原地 180°，
-         *       换到相反方向继续找（用户要求）
-         *     · 只是走满没碰到东西 → **不转**，直接回扫描，
-         *       由"最近的目标在哪"决定往左还是往右。
-         *   这样左右完全由目标位置决定，不会再被固定方向带着绕圈。 */
-        dogAfter = dogPushDone ? DOG_TURN_AROUND : DOG_SCAN;
-        dogPhase = DOG_PAUSE;
+        if (dogPushDone)
+        {
+          /* 推满了 → 停稳后蜂鸣 + 180° 换方向 */
+          dogAfter = DOG_TURN_AROUND;
+          dogPhase = DOG_PAUSE;
+        }
+        else
+        {
+          /* 只是走满一段（或被提前叫停）→ 先花 60ms 快测一发，
+           * 还在接近就继续走，别立刻付一次 1.4 秒的全扫。 */
+          dogQuickRefCm = dogFrontCm;
+          dogPhase      = DOG_QUICK;
+        }
         dogPhaseMs = t;
       #if DEBUG_SERIAL
         if (dogPushDone) { Serial.println(F("[RACE] 推满，刹车等停稳再掉头")); }
