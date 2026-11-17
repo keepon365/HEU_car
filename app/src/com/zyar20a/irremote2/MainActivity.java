@@ -51,15 +51,24 @@ public class MainActivity extends Activity
     private static final int CODE_SPINL = 0x00FFE01F;
     private static final int CODE_SPINR = 0x00FF906F;
 
-    /** 遛狗模式：遥控器数字键 "0" 的码。车端是「按一下切换」，不是按住才跑。
-     *  它不在固件 KEY_TABLE 里，由 handleFrame() 单独识别。 */
-    private static final int CODE_DOG   = 0x00FF6897;
+    /* ---------- 自动模式：开、关各一个码，车端都是幂等的 ----------
+     * ★ 为什么不用"按一下切换"（v2.6 改的，用户实测踩到）：
+     *   红外是单向的，车跑开、角度偏了，那一帧命令丢一次就再也停不下来；
+     *   而多发几帧提高命中率，在"切换"语义下会把车来回开关。
+     *   拆成开/关两个码之后，同一条命令发一百遍结果都一样，才能放心连发。
+     *     遛狗  开 = 数字键 0      关 = 数字键 1
+     *     比赛  开 = 数字键 2      关 = 数字键 3   */
+    private static final int CODE_DOG_ON    = 0x00FF6897;
+    private static final int CODE_DOG_OFF   = 0x00FF30CF;
+    private static final int CODE_RACE_ON   = 0x00FF18E7;
+    private static final int CODE_RACE_OFF  = 0x00FF7A85;
 
     /* ---------- 配色 ---------- */
     private static final int C_BG     = 0xFF080B10;
     private static final int C_CARD   = 0xFF141B24;
     private static final int C_LINE   = 0xFF232D3A;
-    private static final int C_ACCENT = 0xFF35E0A1;
+    private static final int C_ACCENT = 0xFF35E0A1;   // 遛狗：绿
+    private static final int C_RACE   = 0xFF4FA8E8;   // 比赛：蓝
     private static final int C_TEXT   = 0xFFE9F0F7;
     private static final int C_DIM    = 0xFF7C8B9B;
     private static final int C_DANGER = 0xFFFF5E6C;
@@ -89,6 +98,8 @@ public class MainActivity extends Activity
      * 红外是单向的，车不会回报状态，所以只能在这里自己记着 ——
      * 一旦用户手动操作（按圆盘/停车），车端会退出遛狗，这里也必须同步清掉。 */
     private boolean dogOn = false;
+    private boolean raceOn = false;
+    private TextView raceBtn;             // 比赛模式按钮
 
     /* ---- 自更新状态 ---- */
     private int     upCode      = 0;      // 发现的新版 versionCode
@@ -167,11 +178,11 @@ public class MainActivity extends Activity
         /* 遛狗模式是车自己在跑，退到后台必须显式叫停。
          * 红外是单向的，App 一关就没法再发指令，只能等车端 60 秒硬超时 ——
          * 那期间车会一直追着东西跑，太危险。 */
-        if (dogOn) {
-            fire(CODE_STOP, "退出遛狗", true, FRAMES_STOP);
-            dogOn = false;
-            renderDogBtn();
-            log("遛狗：App 退到后台，已叫停");
+        if (dogOn || raceOn) {
+            if (dogOn)  { fireSlow(CODE_DOG_OFF,  "退出遛狗", 5, 110); dogOn  = false; renderDogBtn();  }
+            if (raceOn) { fireSlow(CODE_RACE_OFF, "退出比赛", 5, 110); raceOn = false; renderRaceBtn(); }
+            fire(CODE_STOP, "退出自动模式", true, FRAMES_STOP);
+            log("自动模式：App 退到后台，已叫停");
         }
         release();                       // 退到后台一定先刹车
         super.onPause();
@@ -380,6 +391,26 @@ public class MainActivity extends Activity
         lpDog.topMargin = dp(10);
         root.addView(dogBtn, lpDog);
 
+        /* ---- 比赛模式 ----
+           车端逻辑：只认"最近"，不管动没动、不论多远，一路顶过去；
+           贴近后还要多推一段（车底有网，物块会被兜进底盘），然后换向继续找。 */
+        raceBtn = new TextView(this);
+        raceBtn.setGravity(Gravity.CENTER);
+        raceBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f);
+        raceBtn.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        raceBtn.setPadding(0, dp(13), 0, dp(13));
+        raceBtn.setClickable(true);
+        raceBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { toggleRace(); }
+        });
+        renderRaceBtn();
+
+        LinearLayout.LayoutParams lpRace = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lpRace.topMargin = dp(8);
+        root.addView(raceBtn, lpRace);
+
         /* ---- 日志 ---- */
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -531,20 +562,67 @@ public class MainActivity extends Activity
         }
     }
 
+    private void renderRaceBtn()
+    {
+        if (raceBtn == null) { return; }
+
+        if (raceOn) {
+            raceBtn.setText("●  比赛中 · 点此停止");
+            raceBtn.setTextColor(0xFF0A1A24);
+            raceBtn.setBackground(round(C_RACE, C_RACE, dp(14)));
+        } else {
+            raceBtn.setText("比赛模式  ·  一直朝最近的东西推过去");
+            raceBtn.setTextColor(C_RACE);
+            raceBtn.setBackground(round(0x1422A6D8, 0x5522A6D8, dp(14)));
+        }
+    }
+
     private void toggleDog()
     {
         if (ir == null) { log("✗ 没有红外服务，无法启动"); return; }
+
+        if (raceOn) {                       // 两种自动模式互斥
+            raceOn = false;
+            renderRaceBtn();
+            fireSlow(CODE_RACE_OFF, "比赛模式 关", 4, 120);
+        }
 
         dogOn = !dogOn;
         renderDogBtn();
         buzz(dogOn ? 35 : 15);
 
-        /* 只发一轮两帧就够：车端有 120ms 去重，第二帧会被吃掉，不会把它又切回去。
-         * 千万别像方向键那样持续重发 —— 那是「切换」语义，重发等于来回开关。 */
-        fire(CODE_DOG, dogOn ? "遛狗模式 开" : "遛狗模式 关", true, FRAMES_FIRST);
+        if (dogOn) {
+            fireSlow(CODE_DOG_ON, "遛狗模式 开", 3, 90);
+            log("遛狗：先追会动的东西；没有就扫一圈，再去找最近的");
+        } else {
+            /* 关闭命令连发 6 帧、间隔 130ms：车这时可能已经跑远或转开，
+             * 单帧很容易打不中。命令是幂等的，多打几次没有副作用。 */
+            fireSlow(CODE_DOG_OFF, "遛狗模式 关", 6, 130);
+            log("遛狗：已停止（关闭命令连发 6 帧，防丢帧）");
+        }
+    }
 
-        log(dogOn ? "遛狗：先追会动的东西；没有就扫一圈，再去找最近的"
-                  : "遛狗：已停止");
+    private void toggleRace()
+    {
+        if (ir == null) { log("✗ 没有红外服务，无法启动"); return; }
+
+        if (dogOn) {                        // 两种自动模式互斥
+            dogOn = false;
+            renderDogBtn();
+            fireSlow(CODE_DOG_OFF, "遛狗模式 关", 4, 120);
+        }
+
+        raceOn = !raceOn;
+        renderRaceBtn();
+        buzz(raceOn ? 35 : 15);
+
+        if (raceOn) {
+            fireSlow(CODE_RACE_ON, "比赛模式 开", 3, 90);
+            log("比赛：只挑最近的，贴近后多推一段把物块兜进底盘，再换方向");
+        } else {
+            fireSlow(CODE_RACE_OFF, "比赛模式 关", 6, 130);
+            log("比赛：已停止（关闭命令连发 6 帧，防丢帧）");
+        }
     }
 
     private void press(int code, String name, boolean needsStop)
@@ -555,12 +633,12 @@ public class MainActivity extends Activity
         }
         if (activeCode == code && needsStop) { return; }   // 同一动作重复按下不重发
 
-        /* 手动接管：车端收到任何动作键都会退出遛狗模式并执行该动作，
+        /* 手动接管：车端收到任何动作键都会退出自动模式并执行该动作，
          * 这里同步把按钮状态清掉，否则界面会一直显示"遛狗中"但车其实早就不听了。 */
-        if (dogOn && code != CODE_DOG) {
-            dogOn = false;
-            renderDogBtn();
-            log("遛狗：手动接管，已退出");
+        if (dogOn || raceOn) {
+            if (dogOn)  { dogOn  = false; renderDogBtn();  }
+            if (raceOn) { raceOn = false; renderRaceBtn(); }
+            log("自动模式：手动接管，已退出");
         }
 
         activeCode      = code;
@@ -595,6 +673,19 @@ public class MainActivity extends Activity
     private void fire(final int code, final String name, final boolean record,
                       final int frames)
     {
+        fireGap(code, name, record, frames, FRAME_GAP_MS);
+    }
+
+    /** 帧间隔可调：自动模式的开关命令要用大间隔分散发送，才扛得住丢帧。 */
+    private void fireSlow(final int code, final String name,
+                          final int frames, final int gapMs)
+    {
+        fireGap(code, name, true, frames, gapMs);
+    }
+
+    private void fireGap(final int code, final String name, final boolean record,
+                         final int frames, final int gapMs)
+    {
         if (ir == null) { return; }
 
         final int[] frame = necFrame(code);
@@ -608,7 +699,7 @@ public class MainActivity extends Activity
                 String err = null;
                 try {
                     for (int i = 0; i < frames; i++) {
-                        if (i > 0) { Thread.sleep(FRAME_GAP_MS); }
+                        if (i > 0) { Thread.sleep(gapMs); }
                         ir.transmit(carrierHz, frame);
                     }
                 } catch (InterruptedException ie) {

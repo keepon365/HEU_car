@@ -16,16 +16,16 @@ rem   TRIM : extra duty so a wheel starts from standstill.
 rem   DUTY : 0..255 for forward / backward / spin-in-place.
 rem ============================================================
 set GAIN_L=256
-set GAIN_R=225
-set TRIM_L=13
+set GAIN_R=222
+set TRIM_L=25
 set TRIM_R=0
 set DUTY_BASE=120
 set DUTY_BACK=96
 set DUTY_SPIN=108
-set DUTY_TURN=65
-set SPEED=1200
-set RAMP_START=40
-set RAMP_MS=2500
+set DUTY_TURN=85
+set SPEED=1100
+set RAMP_START=60
+set RAMP_MS=2000
 rem   RAMP_START : speed when you just pressed, in percent of the cap.
 rem                65 = start at 65%% of DUTY_BASE, climb to 100%%. below 60
 rem                the left wheel may not start at all (its threshold is 73).

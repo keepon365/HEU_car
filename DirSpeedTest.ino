@@ -260,7 +260,7 @@
 //   ⚠️ 上限就是 DUTY_BASE（再乘全局速度 SPEED_PERMILLE）：
 //     "不快过某个速度"这件事由 DUTY_BASE 管，不用再另设一个数。
 #define RAMP_ON            1    // 0 = 关掉，退回"按下即巡航速度"的老行为
-#define RAMP_START_PCT     55   // 刚按下时的目标 = 上限的 55%（132 → 72）
+#define RAMP_START_PCT     60   // 刚按下时的目标 = 上限的 60%（132 → 79）
                                 // ★ 别低于 55：cmd=72 时左 85 / 右 63，两轮都已过门槛
                                 //   （73 / 60），才是同时起步。压到 40 会让起始
                                 //   cmd=57 掉到门槛之下，左轮先越线 → 车往右斜，
@@ -278,46 +278,119 @@
  *  所以任何时候按红外都能立刻接管，不会出现「按下去了但车不理你」。
  *
  *      SCAN  舵机 150→120→90→60→30，每档静置 150ms 再测（舵机自身震动会污染读数）
- *      PICK  和上一轮同角度比距离：变化 ≥ DOG_MOVE_CM 判为「有东西在动」
+ *      MEAS  同一档连采 DOG_SAMPLE_N 次，记下最小值与最大值
+ *      PICK  「最大-最小 ≥ DOG_MOVE_CM」即判为该方向有东西在动（单轮内比，车没动）
  *            → 在「在动的」里挑**最近**的；一个都没有 → 在「全部」里挑**最近**的
  *      TURN  目标偏离车头超过 DOG_DEAD_DEG 就原地旋转，时长按 DOG_TURN_DPS 开环估算
  *      GO    舵机回中，前进 DOG_GO_MS；期间每 DOG_GO_CHECK_MS 看一次正前方，
- *            ≤ DOG_STOP_CM 立刻刹住
+ *            ≤ DOG_STOP_CM(5cm) 立刻刹住 → 整机转 180° 换方向再扫；
+ *            累计走满 DOG_CONFIRM_MS 也刹车重扫（纠偏）
+ *
+ *    ★ 遛狗模式**不走加速曲线**：指令即满速。手按遥控才需要"按得越久越快"，
+ *      遛狗是程序自己在开，起步慢只会表现成"启动了却不动"。
  *
  *  ---- 安全阀（这几条缺一不可，别删）------------------------------------
  *    · DOG_MAX_MS 硬超时：到点必停，防止车跑丢或电池耗尽
  *    · 连续 DOG_LOST_MAX 次无回波 → 直接退出，防止探头坏了还在盲跑
  *    · 任何映射键（前进/后退/左旋/右旋/停车）都会立刻退出并执行该动作
- *    · 「追到了」（正前方 ≤ DOG_STOP_CM）→ 刹住 + 转开 DOG_ESCAPE_MS 再重扫，
+ *    · 「追到了」（正前方 ≤ DOG_STOP_CM = 5cm）→ 刹住 + **整机转 180°** 换方向再扫，
  *      不会一头顶在墙上反复重试
  *
  *  ---- 调参从哪下手 -----------------------------------------------------
  *    · 追不动/太磨蹭 → DOG_GO_MS 加大（一次走久点）
  *    · 车头对不准 → 标定 DOG_TURN_DPS（实测 1 秒能转多少度）
- *    · 老是撞到才停   → DOG_STOP_CM 加大（18 → 25）
- *    · 把静止物当移动物 → DOG_MOVE_CM 加大（10 → 15）
+ *    · 老是撞到才停   → DOG_STOP_CM 加大（5 → 8）
+ *    · 把静止物当移动物 → DOG_MOVE_CM 加大（8 → 12）
+ *    · 漏掉慢速移动物   → DOG_SAMPLE_GAP_MS 加大（40 → 60，观察窗口变长）
  *    · 左/右判反了    → 把 DOG_ANGLE_REVERSED 改成 1，或串口发 `V` 在线翻转
  * ==========================================================================*/
-#define DOG_ENABLED        1     // 0 = 整个遛狗模式不编译进去（省 flash）
+#define DOG_ENABLED        1     // 0 = 整个自动模式（遛狗 + 比赛）不编译进去
+
+/* ---- 两种自动模式 ----
+ * MODE_DOG  遛狗：优先追"会动的东西"，追到 5cm 转 180° 换方向
+ * MODE_RACE 比赛：**只求最近的**，不管动没动、不管多远，一路顶过去；
+ *            贴近后还要多推一段（车底有网，物块会被兜进去），
+ *            因为物块一旦进底盘就落进盲区，车自然"看不见"了，可以继续收集。
+ *            这也是比赛模式和遛狗模式唯一的本质差别。 */
+#define MODE_DOG           1
+#define MODE_RACE          2
+
+#define RACE_GO_MS       1500    // 比赛：一次前进多久
+#define RACE_PUSH_CM        8    // 比赛：贴到这个距离就开始"多推一段"
+#define RACE_OVERRUN_MS  1200    // 比赛：贴近后再多推这么久，把物块兜进底盘
+#define RACE_TURN_DEG     120    // 比赛：推完转多少度换方向（不转 180，覆盖更均匀）
 #define DOG_SCAN_SETTLE_MS 150   // 舵机到位后静置多久再测（太小 → 读到舵机震动）
-#define DOG_MEAS_TRY       2     // 每档测几发取最小值（第一发常被余波污染）
-#define DOG_MIN_CM         20    // 小于它不算「目标」。必须 ≥ DOG_STOP_CM，否则会选到
-                                 //   一个已经"到达"的目标，立刻又触发转开 → 原地抖动。
-                                 //   这个数还要挡掉车体自身：舵机打到 150/30 时，
-                                 //   车头零件、线束常在 10~15cm 处被读到。
-#define DOG_STOP_CM        18    // 前进时正前方小于它就刹住（"追到了"）
-#define DOG_MOVE_CM        10    // 两轮之间距离变化超过它 → 判为「有东西在动」
+
+/* ---- 单轮扫描 + 同角度多次采样 ----------------------------------------
+ * 车在扫描期间是**静止的**，所以同一个舵机角度上连续几次读数，
+ * 只有「被照到的东西自己在动」才会变。这就是判定运动的全部依据。
+ *
+ * ★ 早先的做法是「扫两轮，同角度跨轮比距离」，前提是车没转过弯 ——
+ *   可车转过弯之后，同一舵机角度对应的世界方向已经变了，比的其实是两个地方，
+ *   转得越多越不准。单轮内比就没有这个问题，因为全程车一动不动。
+ *
+ * 代价：时间窗口只有 DOG_SAMPLE_N × DOG_SAMPLE_GAP_MS（默认 200ms），
+ *   移动得太慢的物体（200ms 内位移不到 DOG_MOVE_CM）测不出来。 */
+#define DOG_SAMPLE_N        5    // 每档连续采几次（同一角度内）
+#define DOG_SAMPLE_GAP_MS  40    // 两次采样之间隔多久（超声手册要求 ≥60ms 才不串波，
+                                 //   但同一点连续测、只用最小值，40ms 足够稳）
+
+#define DOG_MIN_CM          5    // 小于它不算「目标」
+#define DOG_STOP_CM         5    // 前进时正前方 ≤ 它就刹住 → 整机转 180° 换方向
+#define DOG_MOVE_CM         8    // 同一角度多次读数「最大-最小」超过它 → 判为在动
 #define DOG_FWD_PCT        70    // 遛狗前进速度 = DUTY_BASE 的百分之几（别设太低，
                                  //   低于 60 会掉到左轮起转门槛 73 以下）
 #define DOG_GO_MS         700    // 一次前进持续多久
-#define DOG_GO_CHECK_MS   100    // 前进途中多久看一次正前方
+#define DOG_GO_CHECK_MS    50    // 前进途中多久看一次正前方
+                                 //   ★ 5cm 才刹，速度约 0.6m/s，100ms 就是 6cm 的盲走距离
+                                 //   会直接撞上；50ms 压到 3cm，才来得及
 #define DOG_GO_STREAK       3    // 连续直行几次后才重新全扫（省掉空扫的时间）
-#define DOG_TURN_DPS       90    // 原地旋转角速度（度/秒），开环估算用，需实测
-#define DOG_TURN_MIN_MS   120
-#define DOG_TURN_MAX_MS   800
+
+/* ★ 纠偏：连续前进累计到这么久，就必须刹车重新扫一轮，把车头重新对准目标。
+ *   车本身有系统性左偏（右轮摩擦小，GAIN 只能压住大方向，压不干净），
+ *   走得越久偏得越多。原来只靠 DOG_GO_STREAK 控制，最多能连走 3×700=2100ms，
+ *   期间完全不看方向，偏移已经很明显。
+ *   改成 1500ms 兜底：先到 1500 就停下重扫（比 streak 早），
+ *   重扫会把目标的当前方位重新量一遍，等于强制修正一次航向。
+ *   想更直就调小（1200），想少停顿就调大（2000，但会更歪）。*/
+#define DOG_CONFIRM_MS   1500
+
+/* ---- ★ 原地旋转角速度：整个遛狗模式唯一的「时间→角度」换算基准 ----
+ * 车没有编码器，转多少度只能靠「转多久」估，所以这个数错了，
+ * 下面两件事会同时错，而且错同一个倍数：
+ *      ① 转向对准（mag / DPS → 时长）
+ *      ② 启动 / 结束的提示转圈（360 / DPS × 圈数）
+ *
+ * 标定前的值是 90°/s，实测在 DUTY_SPIN 下转得比它快数倍 ——
+ * 结果「提示转一圈」实际转了好几圈，等同于每次转向都转过头同样的倍数。
+ *
+ * 标定方法（不用重烧，串口直接调）：
+ *      U<数值>   设定当前角速度（例：U380）
+ *      K         按当前角速度转整整一圈，用眼睛数
+ *      数出来多转了就调小 U，不到一圈就调大
+ *      Y<毫秒>   不做换算，直接原地左旋这么久（纯测试）
+ * 调准了把数值填回这里，再烧一次固化。
+ *
+ * 注意：转速跟电池电压有关（电量低会慢），标定请在满电时做。 */
+#define DOG_TURN_DPS      290    // 实测标定：2800ms 转约 2.2 圈 → 792°/2.8s ≈ 283，取 290
+#define DOG_TURN_MIN_MS    90    // 太短会原地抖一下，反而不走
+#define DOG_TURN_MAX_MS   700
 #define DOG_DEAD_DEG       18    // 目标偏离车头小于这个角度就直接走，不转
 #define DOG_ESCAPE_MS     420    // 追到了/没目标时，转开多久
 #define DOG_PAUSE_MS      180    // 刹停后等车身晃完
+
+/* ---- 旋转提示（beacon）：给"启动了 / 结束了"一个看得见的回话 ----
+ * 红外是单向的：车不知道手机按了什么，手机也不知道车收没收到。
+ * 两侧唯一共享的通道就是眼睛，所以用原地转圈当确认信号：
+ *      启动 → 向左转 DOG_BEACON_TURNS 圈
+ *      结束 → 向右转 DOG_BEACON_TURNS 圈（含超时、探头失效等自动结束）
+ * 转完自己停住，不需要任何按键。转圈期间照常解红外，按任意键立刻中断。 */
+#define DOG_BEACON_ON        1    // 0 = 关掉这套提示
+#define DOG_BEACON_TURNS     1    // 转几圈
+/* 一圈的时长不再写死，由 DOG_TURN_DPS 换算（360/DPS 秒）。
+ * 原来这里是独立的 2800ms（隐含 128°/s），跟转向用的 DPS 不是一个数，
+ * 两边必然有一边是错的 —— 合并成一个基准，改一个数两边一起对。 */
+#define DOG_BEACON_DUTY      DUTY_SPIN
 #define DOG_MAX_MS      60000UL  // 硬超时，60 秒
 #define DOG_LOST_MAX        6    // 连续无回波多少次就判定探头失效
 #define DOG_ANGLE_REVERSED  0    // 1 = 角度小的那一侧在左（安装方向相反时才改）
@@ -345,7 +418,7 @@
 //   若补偿从 kick 就开始淡出，左侧只能拿到 60+13×(120-60)/60 = 73，
 //   这次碰巧够（因为阈值差正好 13），但阈值差再大一点就会差若干格，
 //   表现成"补偿了但还是晚一步"。所以一律按"先给满，过了阈值再淡出"写。
-#define TRIM_LEFT        13    // 左轮"起步"补偿（谁先动的问题）
+#define TRIM_LEFT        25    // 左轮"起步"补偿（谁先动的问题）
 #define TRIM_RIGHT         0
 #define COMP_FADE_START   95    // 低于这个指令值：给满 TRIM（比两个阈值高 20+ 余量）
 
@@ -362,7 +435,7 @@
 //   256 = 不打折；250 ≈ 97.7%（每 2 米少走约 4.6cm）；240 ≈ 93.8%。
 //   千分之几的差，跑 2 米就能看出十几厘米，所以每次动 ±2~4 就够，别一次跳 10。
 #define GAIN_LEFT        256    // 左轮：不打折（左轮摩擦大，是"慢"的一侧）
-#define GAIN_RIGHT       225    // 右轮摩擦小、更容易转 → 压低它等于把车头往右掰
+#define GAIN_RIGHT       222    // 右轮摩擦小、更容易转 → 压低它等于把车头往右掰
 
 // ---- ★ 增益只对"直行"生效 ----
 // 单边转弯和原地旋转也压一轮，会把动作本身带歪，而且这种歪是白歪的：
@@ -386,12 +459,60 @@ const uint8_t RECV_PIN = A4;
 const uint8_t US_TRIG = A0;
 const uint8_t US_ECHO = A1;
 
-/* 舵机信号线：三个候选脚**同时**输出同一角度，接在哪个都能动，不必先问接线。
- * 这三个是本项目里唯一既不占 PWM、也不占中断、也没被传感器占用的脚：
- *   D2/D7/D12 空闲；D3 循迹左；D4 循迹右；D5/D6 电机 PWM；D8~D11 电机方向。
- * Servo 库只占 Timer1，与 Timer0（PWM/millis）和 Timer2（红外）不冲突。 */
-const uint8_t SERVO_PINS[] = { 2, 7, 12 };
+/* ---- 云台舵机：**180° 位置舵机**，接 D12 ----
+ * 扫描超声波时用它左右转。
+ * ★ 早先三个脚（D2/D7/D12）同时输出同一角度，是为了排查接线时不用问。
+ *   现在 D2/D7 被两颗 360° 舵机占了，**必须拆开** ——
+ *   360 舵机收到同一个"角度"信号不会定位，只会按脉宽持续转，会乱转。
+ * Servo 库占 Timer1，与 Timer0（电机 PWM / millis）和 Timer2（红外）不冲突。 */
+const uint8_t PIN_CAM    = 12;      // 云台 180° 舵机
+const uint8_t PIN_S360_L = 2;       // 左 360° 连续旋转
+const uint8_t PIN_S360_R = 7;       // 右 360° 连续旋转
+
+const uint8_t SERVO_PINS[] = { PIN_CAM };
 const uint8_t SERVO_N      = sizeof(SERVO_PINS) / sizeof(SERVO_PINS[0]);
+
+/* ---- 两颗 360° 舵机的标定值（2026-11-17 实测）----
+ * 幅度 175us（脉宽 1325us）下，4.0 秒转 3.75 圈 → 337 度/秒
+ * 极性（实测，与常见资料相反）：< 1500us 顺时针，> 1500us 逆时针，1500 停
+ * ★ 360 舵机没有角度反馈，"转 N 度"= 角度 ÷ 角速度 算时间，开环。
+ *   单次误差约 ±10~15 度，反复调用会累积；要绝对位置得加机械挡块。 */
+#define S360_AMP   175              // 速度幅度（离 1500 的脉宽差）
+#define S360_DPS   337              // 度/秒
+#define S360_STOP  1500
+
+Servo srv360L;                      // D2
+Servo srv360R;                      // D7
+
+/* 两颗 360° 舵机都停住（脉宽 1500 才是停，写角度 90 在它们身上也是停，
+ * 但明确用 writeMicroseconds 更不容易被误解） */
+void s360Brake()
+{
+  srv360L.writeMicroseconds(S360_STOP);
+  srv360R.writeMicroseconds(S360_STOP);
+}
+
+/* 让某一侧 360° 舵机转 deg 度（正 = 顺时针）。
+ * ★ 这是**阻塞版**：内部按时间等它转完。90 度约 270ms，短动作够用；
+ *   以后要做"边走边动"这种并行动作，得改成记到期时刻的非阻塞写法。
+ *   which: 'L' 左(D2) / 'R' 右(D7) / 'B' 两颗 */
+void s360Spin(char which, int16_t deg)
+{
+  if (deg == 0) { return; }
+
+  const uint16_t a  = (uint16_t)((deg < 0) ? -deg : deg);
+  uint32_t ms = (uint32_t)a * 1000UL / (uint32_t)S360_DPS;
+  if (ms < 20) { ms = 20; }          // 太短舵机来不及响应
+
+  const uint16_t us = (deg > 0) ? (uint16_t)(S360_STOP - S360_AMP)
+                                : (uint16_t)(S360_STOP + S360_AMP);
+
+  if (which == 'L' || which == 'B') { srv360L.writeMicroseconds(us); }
+  if (which == 'R' || which == 'B') { srv360R.writeMicroseconds(us); }
+
+  delay(ms);                         // 转到位的等待
+  s360Brake();
+}
 
 /* ---------------------------------------------------------------------------
  *  ★ EN 交叉开关（实测发现的问题，务必看清）
@@ -471,10 +592,18 @@ const KeyAction KEY_TABLE[] =
 };
 const uint8_t KEY_COUNT = sizeof(KEY_TABLE) / sizeof(KEY_TABLE[0]);
 
-/* 遛狗模式的触发键：遥控器上的数字键 "0"（0x00FF6897）。
- * 它**不进 KEY_TABLE**，因为语义不一样：别的键是"按住才走"，这个是"按一下切换状态"。
- * App 端 v2.4 起用圆盘下方那颗「遛狗」按钮发这个码。 */
-const uint32_t CODE_DOG = 0x00FF6897UL;
+/* ---- 自动模式的触发键：开、关各一个码，**都幂等** ----
+ * ★ 为什么不是"按一下切换"（2026-11-17 用户实测踩到）：
+ *   红外是单向、无确认的。车一旦跑开、角度偏了，那一帧结束命令丢了，
+ *   车就再也停不下来；而 App 为了提高命中率多补两帧，反而会把它来回切。
+ *   所以改成「开」「关」两个不同码：同一条命令发一百遍，结果都一样。
+ *      遛狗  开 = 数字键 0 (0x00FF6897)   关 = 数字键 1 (0x00FF30CF)
+ *      比赛  开 = 数字键 2 (0x00FF18E7)   关 = 数字键 3 (0x00FF7A85)
+ * 四个都不进 KEY_TABLE，语义和"按住才走"不同。 */
+const uint32_t CODE_DOG_ON   = 0x00FF6897UL;
+const uint32_t CODE_DOG_OFF  = 0x00FF30CFUL;
+const uint32_t CODE_RACE_ON  = 0x00FF18E7UL;
+const uint32_t CODE_RACE_OFF = 0x00FF7A85UL;
 
 /* ---------------------------------------------------------------------------
  *  【全局状态】
@@ -548,8 +677,13 @@ uint8_t scaleSpeed(uint8_t duty)
  * （arduino-cli 的自动原型不覆盖 #if 块里的函数，所以必须手写。） */
 #if DOG_ENABLED
 extern bool dogOn;
-void dogStart();
-void dogStop(const char *why);
+extern uint8_t dogMode;
+extern uint16_t turnDps;                                 // 运行时旋转角速度（度/秒）
+void     dogServoWrite(uint8_t deg);                     // 云台（C 命令要用）
+uint32_t beaconOneTurnMs();
+void spinFor(int8_t side, uint32_t ms);
+void dogStart(uint8_t mode);
+void dogStop(const char *why, bool withBeacon = true);   // 默认带"结束"旋转提示
 #endif
 
 char    cmdBuf[10];
@@ -607,11 +741,15 @@ void handleSerialCmd()
   if (k >= 'a' && k <= 'z') { k = (char)(k - 32); }   // 小写也认
 
   int16_t v = 0;
-  for (uint8_t i = 1; i < cmdLen; i++)
+  uint8_t i = 1;
+  bool    neg = false;
+  if (i < cmdLen && cmdBuf[i] == '-') { neg = true; i++; }
+  for (; i < cmdLen; i++)
   {
     if (cmdBuf[i] < '0' || cmdBuf[i] > '9') { break; }
     v = (int16_t)(v * 10 + (cmdBuf[i] - '0'));
   }
+  if (neg) { v = (int16_t)(-v); }
 
   switch (k)
   {
@@ -639,7 +777,84 @@ void handleSerialCmd()
     /* 串口也能开关遛狗模式：调参时不用一直举着手机按红外。
      * 和按遥控器上的数字键 0 完全等价。 */
     case 'G':
-      if (dogOn) { dogStop("串口命令"); } else { dogStart(); }
+      if (dogOn) { dogStop("串口命令"); } else { dogStart(MODE_DOG); }
+      return;
+
+    /* P = 比赛模式（只求最近的，贴近继续推）。调试时不用举手机。 */
+    case 'P':
+      if (dogOn && dogMode == MODE_RACE) { dogStop("串口命令"); }
+      else
+      {
+        if (dogOn) { dogStop("切换模式", false); }
+        dogStart(MODE_RACE);
+      }
+      return;
+
+    /* ---- 三颗舵机的手动测试（标定/装机构时用）----
+     *   X<度>  左 360° 舵机转多少度（正=顺时针，例 X90 / X-45）
+     *   Z<度>  右 360° 舵机同上
+     *   C<度>  云台 180° 舵机转到绝对角度（0~180） */
+    case 'X':
+      if (v != 0 && v >= -720 && v <= 720)
+      {
+        Serial.print(F("[360] 左舵机 "));
+        Serial.print(v > 0 ? F("顺") : F("逆"));
+        Serial.print(F("时针 "));
+        Serial.println(v > 0 ? v : -v);
+        s360Spin('L', v);
+      }
+      return;
+
+    case 'Z':
+      if (v != 0 && v >= -720 && v <= 720)
+      {
+        Serial.print(F("[360] 右舵机 "));
+        Serial.print(v > 0 ? F("顺") : F("逆"));
+        Serial.print(F("时针 "));
+        Serial.println(v > 0 ? v : -v);
+        s360Spin('R', v);
+      }
+      return;
+
+    /* ---- 旋转角速度标定：一次烧录就能调准，不用反复重刷 ----
+     *   U<数值>   设定角速度（度/秒），例 U380
+     *   K         按当前角速度转「整整一圈」，用眼睛看是不是真的一圈
+     *   Y<毫秒>   不做换算，直接原地左旋这么久（方便自己数）
+     * 调准之后把数值写回 DOG_TURN_DPS 再烧一次固化。 */
+    case 'U':
+      if (v >= 60 && v <= 900)
+      {
+        turnDps = (uint16_t)v;
+        Serial.print(F("[DOG] 旋转角速度="));
+        Serial.print(turnDps);
+        Serial.print(F(" deg/s   转一圈="));
+        Serial.print(beaconOneTurnMs());
+        Serial.println(F("ms   发 K 试一圈"));
+        return;
+      }
+      Serial.println(F("[DOG] 用法 U<60~900>   例 U380"));
+      return;
+
+    case 'C':
+      if (v >= 0 && v <= 180)
+      {
+        dogServoWrite((uint8_t)v);
+        Serial.print(F("[云台] -> "));
+        Serial.print(v);
+        Serial.println(F(" 度"));
+      }
+      else
+      {
+        Serial.println(F("[云台] 用法 C<0~180>，例 C90"));
+      }
+      return;
+
+    case 'K':
+      spinFor(-1, beaconOneTurnMs());
+      return;
+
+    case 'Y':
+      spinFor(-1, (v > 0) ? (uint32_t)v : 1000UL);
       return;
 #endif
     case 'D':
@@ -679,6 +894,10 @@ void serviceSerial()
 #if DOG_ENABLED
 Servo dogServos[SERVO_N];
 
+/* 原地旋转角速度（度/秒）。运行时可被串口 U 命令改，方便一次烧录就标定完。
+ * 所有「转多久 = 转多少度」的换算都必须走这个变量，不要再另起炉灶写死毫秒。 */
+uint16_t turnDps = DOG_TURN_DPS;
+
 /* 扫描角度表：从右往左（或反过来，取决于舵机安装方向 —— 见 DOG_ANGLE_REVERSED）。
  * 只取 5 档而不是 9 档：一轮扫描的时间直接决定追东西的跟手程度，
  * 30° 步长已经够判断"目标在哪个方向"了。 */
@@ -686,14 +905,29 @@ const uint8_t DOG_ANGLES[] = { 150, 120, 90, 60, 30 };
 const uint8_t DOG_ANGLES_N = sizeof(DOG_ANGLES) / sizeof(DOG_ANGLES[0]);
 
 uint16_t dogProf[DOG_ANGLES_N];       // 本轮各角度距离（cm；0 = 无回波）
-uint16_t dogProfPrev[DOG_ANGLES_N];   // 上一轮，用来判断"有没有东西在动"
+/* 单轮内判定：这一档的多次读数波动是否够大。不再需要「上一轮」数组。 */
+bool     dogMove[DOG_ANGLES_N];       // true = 这个方向有东西在动
+
+/* 同一档内的采样进度 */
+uint8_t  dogSmpIdx     = 0;           // 本档已采几次
+uint16_t dogSmpMin     = 0;           // 本档最小读数（0 = 还没采到有效值）
+uint16_t dogSmpMax     = 0;           // 本档最大读数
+uint8_t  dogSmpOk      = 0;           // 本档有效读数个数
 
 bool     dogOn         = false;
+uint8_t  dogMode       = 0;           // 0=关  1=MODE_DOG 遛狗  2=MODE_RACE 比赛
+bool     dogPushDone   = false;       // 比赛模式：这一段的「多推」是否已经加过
 // angleReversed 定义在上面（串口命令要先用到它）
 
 uint8_t  dogPhase      = 0;           // 阶段常量见下面 DOG_IDLE 等
 uint32_t dogPhaseMs    = 0;           // 进入当前阶段的时刻
 uint32_t dogStartMs    = 0;           // 本次遛狗的开始时刻（硬超时用）
+uint32_t dogGoStartMs  = 0;           // 这一串「连续前进」的起点（纠偏计时用）
+
+/* 旋转提示状态：0=没有  1=左旋(启动)  2=右旋(结束)
+ * 必须声明在 setWheels() 之前 —— 它要让转圈也走"直给满速"，别被加速曲线拖住。 */
+uint8_t  beaconPhase = 0;
+uint32_t beaconUntil = 0;
 uint8_t  dogIdx        = 0;           // 扫描进度
 uint8_t  dogLost       = 0;           // 连续无回波计数
 uint32_t dogHoldMs     = 0;           // TURN / GO 要持续多久
@@ -730,12 +964,13 @@ void     handleFrame();
 /* 遛狗模式（实现见 handleFrame 之前那一整段） */
 void     dogServoWrite(uint8_t deg);
 uint16_t dogMeasure();
-bool     dogIsMoving(uint8_t i);
 void     dogPick();
 void     dogTurn(uint32_t ms, int8_t side, uint8_t after);
 void     dogGo(uint32_t ms);
-void     dogStart();
-void     dogStop(const char *why);
+void     dogStart(uint8_t mode);
+void     dogStop(const char *why, bool withBeacon);
+void     beaconCancel();
+void     serviceBeacon();
 void     serviceDog();
 
 /* ---------------------------------------------------------------------------
@@ -799,6 +1034,9 @@ void setup()
   Serial.println(F("超声波 Trig=A0 Echo=A1"));
   Serial.print (F("   串口 V=翻转左右判定  "));
   Serial.print (F("舵机中位="));  Serial.println(angleReversed ? F("反向") : F("正向"));
+  Serial.print (F("   旋转角速度=")); Serial.print(turnDps);
+  Serial.print (F(" deg/s（一圈 ")); Serial.print(beaconOneTurnMs());
+  Serial.println(F("ms）  串口 U<K值> 调，K 试一圈"));
 #endif
   Serial.println(F("=============================================="));
 #endif
@@ -809,12 +1047,17 @@ void setup()
   digitalWrite(US_TRIG, LOW);
 
 #if DOG_ENABLED
-  /* 三个候选脚**同时**接管：用户不必先告诉我们舵机接在哪个脚，
-   * 接在 D2 / D7 / D12 任意一个都会动。 */
+  /* 云台一个舵机（D12）。D2/D7 已改成 360° 连续旋转舵机，不在这里管。 */
   for (uint8_t i = 0; i < SERVO_N; i++) { dogServos[i].attach(SERVO_PINS[i]); }
   dogServoWrite(90);     // 上电先回中：装探头、对方向时它不该自己扭走
   delay(250);            // 等它转到位（这点开机时间没有影响）
 #endif
+
+  /* 两颗 360° 舵机：**无论遛狗模式开没开都要接管并停住**。
+   * 不给信号时它们是"自由"的，一碰就转，装车时会很别扭。 */
+  srv360L.attach(PIN_S360_L);
+  srv360R.attach(PIN_S360_R);
+  s360Brake();
 
   brakeCar();          // 上电先确保电机停着
   irrecv.enableIRIn(); // 红外接收开始（占用 Timer2，与 Timer0 的 PWM 互不影响）
@@ -995,7 +1238,20 @@ void setWheels(int8_t left, int8_t right, uint8_t duty)
   wheelRight = right;
   moving     = true;
   wheelCmdDuty = duty;                 // 记住标称值：改全局速度时要用它重算
-  targetDuty   = scaleSpeed(rampedDuty(duty));   // 只给起点，之后由 serviceRamp 往上推
+
+  /* ★ 遛狗模式不走「按住加速」曲线。
+   *   原因：曲线起点是 RAMP_START_PCT（55%），而遛狗前进档的标称值只有
+   *   DUTY_BASE×70% = 84，55% 只有 46 —— 低于左轮门槛 73、右轮门槛 60，
+   *   于是每段起步的几百毫秒里两个轮子根本不转，表现为"启动了却不动"。
+   *   再加上一段只走 700ms，2000ms 的曲线永远爬不到顶，速度一直上不去。
+   *   这里直接给满，靠 TRIM/GAIN 的直线补偿控制方向就够。 */
+#if DOG_ENABLED
+  const bool dogActive = dogOn || (beaconPhase != 0);
+#else
+  const bool dogActive = false;
+#endif
+  targetDuty   = scaleSpeed(dogActive ? duty : rampedDuty(duty));
+
   lastCommandMs = nowMs();
 
   applyOutput();   // 方向立刻生效；占空比交给 serviceRamp() 爬向 targetDuty
@@ -1089,6 +1345,22 @@ void refreshRampedTarget()
  * -------------------------------------------------------------------------*/
 void serviceRamp()
 {
+#if DOG_ENABLED
+  /* 遛狗模式：指令即到位，不爬坡。
+   * 不做 kick、不做 hold、不做手按加速 —— 走起来就是满速，
+   * 刹车也走 applyOutput 的 normal 路径。*/
+  if (dogOn || beaconPhase != 0)
+  {
+    if (currentDuty != targetDuty)
+    {
+      currentDuty = targetDuty;
+      holdUntilMs = 0;
+      applyOutput();
+    }
+    return;
+  }
+#endif
+
   refreshRampedTarget();          // 按住越久，目标值越高（封顶在 DUTY_BASE）
 
   if (currentDuty == targetDuty) { return; }
@@ -1227,11 +1499,16 @@ uint32_t nowMs()
 
 #define DOG_IDLE   0
 #define DOG_SCAN   1   // 把舵机转到 dogIdx 那一档
-#define DOG_MEAS   2   // 等舵机稳住，再测距
+#define DOG_MEAS   2   // 同一档连采 N 次（等舵机稳住 → 采 → 间隔 → 采…）
 #define DOG_PICK   3   // 分析这一轮，选目标
 #define DOG_TURN   4   // 原地旋转中
 #define DOG_PAUSE  5   // 刹停后等车身晃完
 #define DOG_GO     6   // 前进中
+#define DOG_BEACON 7   // 启动提示：原地左旋中（转完才开始扫描）
+#define DOG_TURN_AWAY 8  // 只给 dogAfter 用：停稳后转 180° 换方向，不是真实阶段
+#define DOG_RACE_TURN 9  // 只给 dogAfter 用：比赛模式走完一段，停稳后转 RACE_TURN_DEG
+                         //   ★ 必须和 DOG_SCAN 分开，否则 PAUSE 分不清
+                         //   "刚走完要换向" 和 "刚转完该扫描"，会死循环原地转。
 
 void dogServoWrite(uint8_t deg)
 {
@@ -1257,14 +1534,10 @@ uint16_t dogMeasure()
   return cm;
 }
 
-/* 这一档的物体是不是"在动"：和上一轮同角度比距离。
- * 两轮里有一轮没读数就没法比，一律当静止 —— 宁可漏判，也别把噪声当目标追。 */
-bool dogIsMoving(uint8_t i)
-{
-  if (dogProfPrev[i] == 0 || dogProf[i] == 0) { return false; }
-  const int16_t diff = (int16_t)dogProfPrev[i] - (int16_t)dogProf[i];
-  return (diff >= (int16_t)DOG_MOVE_CM) || (diff <= -(int16_t)DOG_MOVE_CM);
-}
+/* 这一档有没有东西在动 —— 由「单轮内多次采样」在 MEAS 阶段算好，直接读结果。
+ * 判定条件：同一角度连续几次读数的「最大 - 最小」≥ DOG_MOVE_CM。
+ * 车全程静止，所以这点波动只可能来自被照到的东西自己动了。 */
+bool dogIsMoving(uint8_t i) { return dogMove[i]; }
 
 /* 选目标：先在"在动的"里挑最近的，没有就在全部里挑最近的 */
 void dogPick()
@@ -1279,8 +1552,10 @@ void dogPick()
     const uint16_t d = dogProf[i];
     if (d == 0 || d < DOG_MIN_CM) { continue; }
 
-    if (dogIsMoving(i) && d < bmd) { bm = (int8_t)i; bmd = d; }
-    if (d < bsd)                   { bs = (int8_t)i; bsd = d; }
+    /* 比赛模式不看"动没动" —— 物块是死的，而且小到会钻进底盘盲区，
+     * 只按"最近"来选。遛狗模式才优先挑会动的东西。 */
+    if (dogMode != MODE_RACE && dogIsMoving(i) && d < bmd) { bm = (int8_t)i; bmd = d; }
+    if (d < bsd)                                           { bs = (int8_t)i; bsd = d; }
   }
 
   if (bm >= 0)      { dogTargetIdx = bm; dogTargetMoving = true;  dogTargetCm = bmd; }
@@ -1306,6 +1581,19 @@ void dogPrintMap()
 }
 #endif
 
+/* 掉头（180°）需要多久。由 turnDps 换算，不写死 ——
+ * 标定值一改，这里跟着变。上限 1.5s 只是防呆（turnDps 被设成 60 时会算出 3 秒）。 */
+uint32_t turnMsFor(uint16_t deg)
+{
+  const uint16_t dps = turnDps ? turnDps : DOG_TURN_DPS;
+  uint32_t ms = (uint32_t)deg * 1000UL / (uint32_t)dps;
+  if (ms < DOG_TURN_MIN_MS) { ms = DOG_TURN_MIN_MS; }
+  if (ms > 1500)            { ms = 1500; }
+  return ms;
+}
+
+uint32_t dogTurn180Ms() { return turnMsFor(180); }
+
 /* 原地旋转。after 决定转完去哪儿（对准目标 → DOG_GO；找目标 → DOG_SCAN）。
  * 用 DUTY_SPIN，和 App 圆盘左右是同一个动作、同一个占空比，走起来手感一致。 */
 void dogTurn(uint32_t ms, int8_t side, uint8_t after)
@@ -1330,7 +1618,12 @@ void dogTurn(uint32_t ms, int8_t side, uint8_t after)
 /* 前进一段。舵机必须先回中，否则测的不是车要走的那条路。 */
 void dogGo(uint32_t ms)
 {
-  dogHoldMs  = ms;
+  /* 从别的阶段进入 GO = 新的一串连续前进，纠偏计时从这里重新开始。
+   * 连续段（dogStreak 累加）不会调用 dogGo，所以计时是累加的。 */
+  if (dogPhase != DOG_GO) { dogGoStartMs = nowMs(); }
+
+  dogPushDone = false;              // 每段重新计"多推"是否已触发
+  dogHoldMs   = ms;
   dogPhaseMs = nowMs();
   dogCheckMs = nowMs();
   dogFrontCm = 0;
@@ -1343,16 +1636,89 @@ void dogGo(uint32_t ms)
 
 #if DEBUG_SERIAL
   Serial.print(F("[DOG] 前进 duty="));
-  Serial.println(scaleSpeed(d));
+  Serial.print(scaleSpeed(d));
+  Serial.print(F(" 直给(不走加速曲线)  已走 "));
+  Serial.print((nowMs() - dogGoStartMs) / 1000);
+  Serial.println(F("s"));
 #endif
 }
 
-void dogStart()
+/* ---------------------------------------------------------------------------
+ *  旋转提示：启动 / 结束的"回话"
+ * ---------------------------------------------------------------------------
+ *  非阻塞：只在 loop 里数时间，转圈期间照常解红外。
+ *  任何按键都会先 beaconCancel()，所以它绝不会挡住你接管。
+ * -------------------------------------------------------------------------*/
+
+/* 转一圈要多久（ms）。由 turnDps 换算，和「转向对准」共用同一个基准 ——
+ * 以前这里写死 2800ms，跟 DPS 差了三四倍，是「说转一圈、实际转好几圈」的根源。 */
+uint32_t beaconOneTurnMs()
 {
+  const uint16_t dps = turnDps ? turnDps : DOG_TURN_DPS;
+  return 360000UL / (uint32_t)dps;
+}
+
+/* 真正驱动电机的那层。非阻塞（只记截止时刻，由 serviceBeacon 收尾），
+ * 所以标定测试命令和提示转圈共用它，按任意键都能立刻掐停。 */
+void spinFor(int8_t side, uint32_t ms)
+{
+  beaconPhase = (side < 0) ? 1 : 2;      // 先置位：setWheels 看到它就不走加速曲线
+  beaconUntil = nowMs() + ms;
+
+  if (side < 0) { setWheels(DIR_FORWARD,  DIR_BACKWARD, DOG_BEACON_DUTY); }
+  else          { setWheels(DIR_BACKWARD, DIR_FORWARD,  DOG_BEACON_DUTY); }
+
+#if DEBUG_SERIAL
+  Serial.print(F("[DOG] 原地旋转 "));
+  Serial.print(side < 0 ? F("左") : F("右"));
+  Serial.print(' ');
+  Serial.print(ms);
+  Serial.println(F("ms"));
+#endif
+}
+
+void beaconStart(int8_t side, uint32_t ms)
+{
+#if DOG_BEACON_ON
+  spinFor(side, ms);
+#else
+  (void)side;
+  (void)ms;
+#endif
+}
+
+/* 立刻中断提示旋转（按键接管时用），不让它继续占着电机 */
+void beaconCancel()
+{
+  if (beaconPhase == 0) { return; }
+
+  beaconPhase = 0;
+  brakeCar();
+
+#if DEBUG_SERIAL
+  Serial.println(F("[DOG] 提示旋转被中断"));
+#endif
+}
+
+/* 每拍调用：到点就停 */
+void serviceBeacon()
+{
+  if (beaconPhase == 0) { return; }
+  if ((int32_t)(nowMs() - beaconUntil) < 0) { return; }
+
+  beaconPhase = 0;
+  brakeCar();
+}
+
+void dogStart(uint8_t mode)
+{
+  beaconCancel();                 // 万一上一条提示还没转完
+
+  dogMode         = mode;
   dogOn           = true;
   dogStartMs      = nowMs();
   dogPhaseMs      = nowMs();
-  dogPhase        = DOG_SCAN;
+  dogPhase        = DOG_BEACON;    // 先左转一圈当"已启动"，转完自动进扫描
   dogIdx          = 0;
   dogLost         = 0;
   dogStreak       = 0;
@@ -1361,29 +1727,47 @@ void dogStart()
   dogTargetCm     = 0;
 
   // 历史清空 → 第一轮没有可比对象，全部按静止处理，直接去最近的
-  for (uint8_t i = 0; i < DOG_ANGLES_N; i++) { dogProf[i] = 0; dogProfPrev[i] = 0; }
+  for (uint8_t i = 0; i < DOG_ANGLES_N; i++) { dogProf[i] = 0; dogMove[i] = false; }
 
   dogServoWrite(90);
 
 #if DEBUG_SERIAL
-  Serial.println(F("[DOG] ===== 遛狗模式 启动 ====="));
+  Serial.println(mode == MODE_RACE ? F("[DOG] ===== 比赛模式 启动 =====")
+                                   : F("[DOG] ===== 遛狗模式 启动 ====="));
   Serial.print(F("[DOG] 前进 duty="));
   Serial.print(scaleSpeed((uint8_t)((uint16_t)DUTY_BASE * DOG_FWD_PCT / 100)));
-  Serial.print(F("  停止距离 "));
-  Serial.print(DOG_STOP_CM);
-  Serial.print(F("cm  移动判定 "));
-  Serial.print(DOG_MOVE_CM);
-  Serial.println(F("cm"));
+  if (mode == MODE_RACE)
+  {
+    Serial.print(F("  贴近 "));
+    Serial.print(RACE_PUSH_CM);
+    Serial.print(F("cm 后多推 "));
+    Serial.print(RACE_OVERRUN_MS);
+    Serial.print(F("ms，换向 "));
+    Serial.print(RACE_TURN_DEG);
+    Serial.println(F(" 度"));
+  }
+  else
+  {
+    Serial.print(F("  停止距离 "));
+    Serial.print(DOG_STOP_CM);
+    Serial.print(F("cm  移动判定 "));
+    Serial.print(DOG_MOVE_CM);
+    Serial.println(F("cm"));
+  }
 #endif
+
+  // 左转一圈 = "已启动"。转完由 DOG_BEACON 阶段自动接着扫描。
+  beaconStart(-1, beaconOneTurnMs() * (uint32_t)DOG_BEACON_TURNS);
 }
 
-void dogStop(const char *why)
+void dogStop(const char *why, bool withBeacon)
 {
   if (!dogOn) { return; }
 
   const uint32_t ran = nowMs() - dogStartMs;
 
   dogOn    = false;
+  dogMode  = 0;
   dogPhase = DOG_IDLE;
   brakeCar();
   dogServoWrite(90);
@@ -1398,6 +1782,10 @@ void dogStop(const char *why)
   (void)why;
   (void)ran;
 #endif
+
+  /* 右转一圈 = "已结束"。手动接管那种情况不转：用户下一帧就要开车，
+   * 转圈只会和按键抢电机。 */
+  if (withBeacon) { beaconStart(+1, beaconOneTurnMs() * (uint32_t)DOG_BEACON_TURNS); }
 }
 
 void serviceDog()
@@ -1410,32 +1798,58 @@ void serviceDog()
 
   switch (dogPhase)
   {
+    // ---- 启动提示：等左旋转完再开始扫描 ----------------------------------
+    case DOG_BEACON:
+      if (beaconPhase == 0)          // 由 serviceBeacon() 在到点时清 0
+      {
+        dogIdx     = 0;
+        dogPhase   = DOG_SCAN;
+        dogPhaseMs = t;
+      }
+      break;
+
     // ---- 把舵机转到这一档 ------------------------------------------------
     case DOG_SCAN:
       dogServoWrite(DOG_ANGLES[dogIdx]);
+      dogSmpIdx = 0; dogSmpMin = 0; dogSmpMax = 0; dogSmpOk = 0;
       dogPhaseMs = t;
       dogPhase   = DOG_MEAS;
       break;
 
-    // ---- 等它停稳，然后测 ------------------------------------------------
+    // ---- 同一档连采 DOG_SAMPLE_N 次，记录最小 / 最大值 ---------------------
     case DOG_MEAS:
     {
-      if ((uint32_t)(t - dogPhaseMs) < DOG_SCAN_SETTLE_MS) { break; }
+      /* 第一次之前要等舵机停稳；之后每两次之间只等采样间隔。
+       * 全程非阻塞（每次只采一发就退出），所以按键随时能接管。 */
+      const uint32_t wait = (dogSmpIdx == 0) ? DOG_SCAN_SETTLE_MS : DOG_SAMPLE_GAP_MS;
+      if ((uint32_t)(t - dogPhaseMs) < wait) { break; }
 
-      uint16_t best = 0;
-      for (uint8_t k = 0; k < DOG_MEAS_TRY; k++)
+      const uint16_t d = dogMeasure();
+      if (d != 0)
       {
-        const uint16_t d = dogMeasure();
-        if (d != 0 && (best == 0 || d < best)) { best = d; }
+        if (dogSmpOk == 0 || d < dogSmpMin) { dogSmpMin = d; }
+        if (d > dogSmpMax)                  { dogSmpMax = d; }
+        dogSmpOk++;
       }
-      dogProf[dogIdx] = best;
 
-      if (best == 0) { if (dogLost < 255) { dogLost++; } }
-      else           { dogLost = 0; }
-
-      dogIdx++;
-      dogPhase   = (dogIdx < DOG_ANGLES_N) ? DOG_SCAN : DOG_PICK;
       dogPhaseMs = t;
+      dogSmpIdx++;
+
+      if (dogSmpIdx < DOG_SAMPLE_N) { break; }   // 本档还没采够，下一拍接着采
+
+      // ---- 本档采完：落库 + 判「有没有东西在动」----
+      dogProf[dogIdx] = dogSmpMin;               // 距离取最小值（余波只会让读数偏小）
+      /* 有效读数不足 2 个就没法比，一律当静止 —— 宁可漏判，也别把噪声当目标追。
+       * 满足 2 个且「最大-最小 ≥ DOG_MOVE_CM」→ 这个方向有东西在动。 */
+      dogMove[dogIdx] = (dogSmpOk >= 2) &&
+                        ((uint16_t)(dogSmpMax - dogSmpMin) >= DOG_MOVE_CM);
+
+      if (dogSmpOk == 0) { if (dogLost < 255) { dogLost++; } }
+      else               { dogLost = 0; }
+
+      dogSmpIdx = 0; dogSmpMin = 0; dogSmpMax = 0; dogSmpOk = 0;
+      dogIdx++;
+      dogPhase = (dogIdx < DOG_ANGLES_N) ? DOG_SCAN : DOG_PICK;
       break;
     }
 
@@ -1446,16 +1860,13 @@ void serviceDog()
       dogPrintMap();
     #endif
       dogPick();
-
-      // 本轮存成历史；下一轮就跟它比"有没有东西在动"
-      for (uint8_t i = 0; i < DOG_ANGLES_N; i++) { dogProfPrev[i] = dogProf[i]; }
       dogIdx = 0;
 
       if (dogLost >= DOG_LOST_MAX) { dogStop("探头无回波"); return; }
 
       if (dogTargetIdx < 0)
       {
-        // 这一圈什么都没有（空场，或者东西全落在 10cm 盲区里）→ 转开再找
+        // 这一圈什么都没有（空场，或者东西全落在 DOG_MIN_CM 以内）→ 转开再找
         dogStreak = 0;
         dogTurn(DOG_ESCAPE_MS, +1, DOG_SCAN);
         break;
@@ -1464,18 +1875,26 @@ void serviceDog()
       const int16_t off = (int16_t)DOG_ANGLES[dogTargetIdx] - 90;
       const int16_t mag = (off < 0) ? (int16_t)(-off) : off;
 
-      // 追到了：正前方且已经贴得很近 → 转开，别顶着墙反复重试
-      if (mag <= DOG_DEAD_DEG && dogTargetCm <= DOG_STOP_CM)
+      /* 追到了：正前方且已经贴到 DOG_STOP_CM(5cm) 以内
+       * → 整机转 180° 换方向，别顶着目标反复重试。 */
+      if (dogMode != MODE_RACE && mag <= DOG_DEAD_DEG && dogTargetCm <= DOG_STOP_CM)
       {
         dogStreak = 0;
-        dogTurn(DOG_ESCAPE_MS, +1, DOG_SCAN);
+        dogTurn(dogTurn180Ms(), +1, DOG_SCAN);
+      #if DEBUG_SERIAL
+        Serial.print(F("[DOG] 已贴到 "));
+        Serial.print(dogTargetCm);
+        Serial.print(F("cm，掉头 180° 用时 "));
+        Serial.print(dogTurn180Ms());
+        Serial.println(F("ms"));
+      #endif
         break;
       }
 
       // 已经对准 → 直接走
       if (mag <= DOG_DEAD_DEG)
       {
-        dogGo(DOG_GO_MS);
+        dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
         break;
       }
 
@@ -1484,7 +1903,7 @@ void serviceDog()
         int8_t side = (off < 0) ? (int8_t)-1 : (int8_t)+1;
         if (angleReversed) { side = (int8_t)(-side); }
 
-        uint32_t ms = (uint32_t)mag * 1000UL / DOG_TURN_DPS;
+        uint32_t ms = (uint32_t)mag * 1000UL / (uint32_t)(turnDps ? turnDps : 1);
         if (ms < DOG_TURN_MIN_MS) { ms = DOG_TURN_MIN_MS; }
         if (ms > DOG_TURN_MAX_MS) { ms = DOG_TURN_MAX_MS; }
 
@@ -1509,7 +1928,23 @@ void serviceDog()
     case DOG_PAUSE:
       if ((uint32_t)(t - dogPhaseMs) < DOG_PAUSE_MS) { break; }
 
-      if (dogAfter == DOG_GO) { dogGo(DOG_GO_MS); }
+      if (dogAfter == DOG_GO)
+      {
+        dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
+      }
+      else if (dogAfter == DOG_TURN_AWAY)
+      {
+        dogIdx = 0;
+        dogTurn(dogTurn180Ms(), +1, DOG_SCAN);   // 贴到 5cm 了 → 掉头换方向
+      }
+      else if (dogAfter == DOG_RACE_TURN)
+      {
+        /* 比赛：走完一段后换一个方向接着找，转 120° 覆盖更均匀（不必掉头）。
+         * after 传 DOG_SCAN，所以转完回到 PAUSE 时会走最后的 else 直接扫描，
+         * 不会又触发一次换向。 */
+        dogIdx = 0;
+        dogTurn(turnMsFor(RACE_TURN_DEG), +1, DOG_SCAN);
+      }
       else
       {
         dogIdx     = 0;
@@ -1521,6 +1956,50 @@ void serviceDog()
     // ---- 前进中 ----------------------------------------------------------
     case DOG_GO:
     {
+      /* ================= 比赛模式 =================
+       * 和遛狗最大的不同：**贴到东西也不停**。
+       * 车底有一张网，物块比底盘还矮，一旦被推进底盘就落进超声波的盲区，
+       * 于是"看不见了" —— 这正是我们要的，车可以继续收集下一个。
+       * 所以贴近后不但不停，还要**再多推一段**（RACE_OVERRUN_MS），
+       * 确保物块真的被兜进去，而不是刚好卡在边缘。 */
+      if (dogMode == MODE_RACE)
+      {
+        if ((uint32_t)(t - dogCheckMs) >= DOG_GO_CHECK_MS)
+        {
+          dogCheckMs = t;
+          const uint16_t d = dogMeasure();
+
+          if (d != 0)
+          {
+            dogFrontCm = d;
+            if (d <= RACE_PUSH_CM && !dogPushDone)
+            {
+              dogPushDone = true;
+              dogHoldMs  += RACE_OVERRUN_MS;     // 这一段多走一会儿，把物块顶进底盘
+            #if DEBUG_SERIAL
+              Serial.print(F("[RACE] 贴到 "));
+              Serial.print(d);
+              Serial.print(F("cm，继续推 "));
+              Serial.print(RACE_OVERRUN_MS);
+              Serial.println(F("ms 把物块兜进底盘"));
+            #endif
+            }
+          }
+        }
+
+        if ((uint32_t)(t - dogPhaseMs) < dogHoldMs) { break; }
+
+        brakeCar();
+        dogStreak  = 0;
+        dogAfter   = DOG_RACE_TURN;      // 停稳后再换向
+        dogPhase   = DOG_PAUSE;
+        dogPhaseMs = t;
+      #if DEBUG_SERIAL
+        Serial.println(F("[RACE] 这一段走完，换方向"));
+      #endif
+        break;
+      }
+
       // 定期看一眼前方：在撞上之前就停
       if ((uint32_t)(t - dogCheckMs) >= DOG_GO_CHECK_MS)
       {
@@ -1534,17 +2013,37 @@ void serviceDog()
           {
             brakeCar();
             dogStreak  = 0;
-            dogAfter   = DOG_SCAN;      // 到了 → 重扫，看还有没有别的目标
+            /* 先停稳（PAUSE）再掉头：走着的时候直接反向转，
+             * 电流冲击大、齿轮也容易崩。 */
+            dogAfter   = DOG_TURN_AWAY;
             dogPhase   = DOG_PAUSE;
             dogPhaseMs = t;
           #if DEBUG_SERIAL
-            Serial.print(F("[DOG] 到了 "));
+            Serial.print(F("[DOG] 贴到 "));
             Serial.print(d);
-            Serial.println(F("cm，刹住"));
+            Serial.println(F("cm，刹住准备掉头"));
           #endif
             break;
           }
         }
+      }
+
+      /* ★ 纠偏：连续前进累计到 DOG_CONFIRM_MS 就刹车重扫一轮。
+       *   重扫不是浪费时间 —— 它把目标此刻的方位重新量一遍，
+       *   等于把「已经偏掉的车头」重新对准目标，是这里唯一有效的纠偏手段。 */
+      if ((uint32_t)(t - dogGoStartMs) >= DOG_CONFIRM_MS)
+      {
+        brakeCar();
+        dogStreak  = 0;
+        dogAfter   = DOG_SCAN;
+        dogPhase   = DOG_PAUSE;
+        dogPhaseMs = t;
+      #if DEBUG_SERIAL
+        Serial.print(F("[DOG] 走满 "));
+        Serial.print(DOG_CONFIRM_MS);
+        Serial.println(F("ms，刹车重新确认方向"));
+      #endif
+        break;
       }
 
       if ((uint32_t)(t - dogPhaseMs) < dogHoldMs) { break; }
@@ -1623,15 +2122,30 @@ void handleFrame()
   lastCodeMs = t;
 
 #if DOG_ENABLED
-  /* 遛狗键：按一下开、再按一下关。
-   * 用"切换"而不是"按住才跑"，是因为 App 松手会补发停车帧 ——
-   * 如果按住才跑，松手那一刻遛狗模式立刻被杀，根本走不了。 */
-  if (code == CODE_DOG)
+  /* ---- 自动模式：开、关各一个码，两条命令都是幂等的 ----
+   * 红外没有回执，只能靠"重复发同一条命令不会产生副作用"来保证可靠。
+   * 不用"按一下切换"的原因见 CODE_DOG_ON 上面的说明。 */
+  if (code == CODE_DOG_ON || code == CODE_DOG_OFF ||
+      code == CODE_RACE_ON || code == CODE_RACE_OFF)
   {
     pulseLed();
     lastCodeMapped = true;
-    if (dogOn) { dogStop("再次按下"); }
-    else       { dogStart(); }
+
+    if (code == CODE_DOG_OFF || code == CODE_RACE_OFF)
+    {
+      if (dogOn) { dogStop("收到关闭命令"); }
+      else       { Serial.println(F("[DOG] 已经是停止状态")); }
+    }
+    else
+    {
+      const uint8_t want = (code == CODE_RACE_ON) ? MODE_RACE : MODE_DOG;
+      if (dogOn && dogMode == want) { /* 重复帧，什么都不做 */ }
+      else
+      {
+        if (dogOn) { dogStop("切换模式", false); }   // 切模式不转圈
+        dogStart(want);
+      }
+    }
     return;
   }
 #endif
@@ -1642,8 +2156,9 @@ void handleFrame()
     if (KEY_TABLE[i].code != code) { continue; }
 
 #if DOG_ENABLED
-    // 任何动作键都立刻接管：先退出遛狗，再照常执行这个动作
-    if (dogOn) { dogStop("手动接管"); }
+    // 任何动作键都立刻接管：先掐掉提示旋转，再退出遛狗，最后照常执行这个动作
+    beaconCancel();
+    if (dogOn) { dogStop("手动接管", false); }   // 接管时不转圈，免得和按键抢电机
 #endif
 
     pulseLed();
@@ -1703,6 +2218,10 @@ void loop()
   }
 
 #if DOG_ENABLED
+  /* 提示旋转独立于遛狗模式运行：它要在"已结束"之后还能转右圈，
+   * 所以不能塞进 serviceDog（那时 dogOn 已经是 false 了）。 */
+  serviceBeacon();
+
   /* 遛狗模式自己会调 setWheels，所以必须跑在 serviceRamp 之前，
    * 让这一拍就能把新速度算进曲线里。 */
   if (dogOn) { serviceDog(); }
@@ -1714,8 +2233,11 @@ void loop()
 #if DOG_ENABLED
   /* 遛狗模式**不能**走抬手即停：它是"按一下就自己跑"，中间没有帧到达，
    * 看门狗会在 450ms 后把车刹掉 —— 表现成"启动了但只动一下"。
-   * 它的安全由 DOG_MAX_MS 硬超时 + 距离刹停 + 无回波退出负责。 */
-  if (!dogOn) { serviceAutoStop(); }
+   * 它的安全由 DOG_MAX_MS 硬超时 + 距离刹停 + 无回波退出负责。
+   *
+   * ★ 提示旋转同样必须免检：结束提示是在 dogOn 已经变成 false 之后才开始转的，
+   *   否则 450ms 就被看门狗刹住，右旋只转五分之一圈。 */
+  if (!dogOn && beaconPhase == 0) { serviceAutoStop(); }
 #else
   serviceAutoStop();
 #endif
