@@ -360,8 +360,12 @@
 #define Q_CALIB_MS        1000   // Q 标定时转多久（1 秒更好数圈）
                                  //   别太长：车没有编码器，走越久偏得越多。
                                  //   1100ms 走完立刻回扫描重新对准，这就是"多测测"。
-#define RACE_PUSH_CM        8    // 比赛：贴到这个距离就开始"多推一段"
-#define RACE_OVERRUN_MS  1200    // 比赛：贴近后再多推这么久，把物块兜进底盘
+/* 收集判定：只看相邻两次"停下扫描"的最短距离是否反向回升超过这个数。
+ * ★ 这是个**扫描层面的判据**，与前进过程无关 —— 前进阶段现在不测距了。
+ *   阈值得敢取到 40cm：走歪/目标滑出视野时读数也会变大，但幅度有限
+ *   （20cm 的目标偏到 45° 只多 8cm）。40cm 只有"原目标真没了、
+ *   换成了远处的东西"才会出现，所以不需要再做 cos 折算之类的补偿。 */
+#define RACE_COLLECT_RISE_CM 40
                                  //   ★ 走完一段后：推过东西 → 蜂鸣 + 180°；没推过 → 直接回扫描
 #define DOG_SCAN_SETTLE_MS 150   // 遛狗：舵机到位后静置多久再测（太小 → 读到舵机震动）
 #define RACE_SETTLE_MS      90   // 比赛：9 档 15°，每次只转 15°，到位快得多。
@@ -1178,7 +1182,7 @@ bool     dogPushDone   = false;       // 比赛模式：这一段的「多推」
 
 /* ---- 比赛模式的搜索/对准/收集状态 ---- */
 bool     raceSearching = true;        // true = 正在「找目标」，false = 已锁定一个目标在追
-uint16_t raceBestCm    = 0;           // 本轮追踪中出现过的最小距离（0 = 还没有）
+uint16_t lastScanMin   = 0;           // 上一次"停下扫描"的最短有效距离（0 = 没目标）
 uint8_t  raceMissCount = 0;           // 连续「这一圈没有 80cm 内目标」的次数
 uint8_t  raceAimCount  = 0;           // 本轮对准已经微调了几次
 
@@ -1188,7 +1192,6 @@ uint8_t  raceAimCount  = 0;           // 本轮对准已经微调了几次
  * 不等走满 400ms —— 走歪时这一段是纯浪费，还容易从物块旁边擦过去。 */
 uint16_t dogLastCm     = 0;           // GO 中上次测到的前方距离
 uint8_t  dogNoDown     = 0;           // 连续几次没有变近
-uint16_t dogQuickRefCm = 0;           // 这一段结束时的距离（DOG_QUICK 的基准）
 #define RACE_STALL_N 3                // 连续几次不变近就提前结束
 
 int8_t   aimLastIdx = -1;             // 上次微调时目标的档位
@@ -1806,8 +1809,6 @@ uint32_t nowMs()
 #define DOG_BEACON 7   // 启动提示：正在播放启动音，播完才开始扫描（不再转圈）
 #define DOG_TURN_AWAY 8  // 只给 dogAfter 用：停稳后转 180° 换方向，不是真实阶段
 #define DOG_CONFIRM 10  // 对准后回中，实测一次正前方再决定走不走
-#define DOG_QUICK   11  // 走完一段，快速测一发：还在接近就继续走，否则重扫
-#define DOG_TURN_AROUND 9 // 只给 dogAfter 用：比赛模式收集完成，停稳后响一声 + 转 180°
                           //   ★ 必须和 DOG_SCAN 分开，否则 PAUSE 分不清
                           //   "刚走完要换向" 和 "刚转完该扫描"，会死循环原地转。
 
@@ -1955,39 +1956,55 @@ void raceDecide(uint32_t t)
 {
   (void)t;
 
-  /* ---------- ① 这一轮有没有 80cm 内的目标 ---------- */
-  if (dogTargetIdx < 0 || dogTargetCm > RACE_MAX_CM)
+  /* ---------- 先算「这一次停下扫描」的最短有效距离 ---------- */
+  const uint16_t scanMin = (dogTargetIdx >= 0 && dogTargetCm <= RACE_MAX_CM)
+                           ? dogTargetCm : 0;
+
+  /* ---------- 收集判定 ----------
+   * 用户 2026-11-17 定的**唯一**判据：
+   *   这一次停下扫描的最短距离，比上一次停下扫描的最短距离
+   *   **反向回升超过 RACE_COLLECT_RISE_CM(40cm)** → 物块已经进了底盘。
+   *
+   * 为什么阈值敢取到 40cm：车走歪、目标从视野边缘滑出去，读数也会变大，
+   * 但幅度有限（20cm 的目标偏到 45° 也只多 8cm）。40cm 这个跨度只有
+   * "原来的目标真的没了、最近的东西换成了远处的墙/别的东西"才会出现。
+   * 阈值放大之后，就不需要再做 cos 折算那些补偿了 —— 大阈值本身就是过滤器。
+   *
+   * scanMin == 0（这一圈 80cm 内什么都没有）视为无穷大回升，同样算收到。
+   * 第一次扫描时 lastScanMin 还是 0，不参与比较。 */
+  if (lastScanMin > 0 &&
+      (scanMin == 0 || scanMin > (uint16_t)(lastScanMin + RACE_COLLECT_RISE_CM)))
   {
-    /* ★ 先判"是不是刚收完"：物块进底盘之后的结局有两种 ——
-     *     a) 探头前方还有别的东西 → 最近距离**回升**（主路径，见下面 ③）
-     *     b) 探头水平、前方空旷   → 正前方**直接无回波**，目标从 dogProf 里消失，
-     *        dogTargetIdx 变 -1
-     *   不补这一条，(b) 会被当成"这一圈没目标"直接转 90° 走开，
-     *   收集判定被绕过，物块白收。
-     *   所以：追过一个很近的目标、它现在不见了 → 也判定收集成功。 */
-    if (!raceSearching && raceBestCm > 0 && raceBestCm <= RACE_NEAR_CM)
-    {
-    #if DEBUG_SERIAL
-      Serial.print(F("[RACE] 收集成功：目标消失（最近 "));
-      Serial.print(raceBestCm);
-      Serial.println(F("cm）"));
-    #endif
-      raceBestCm    = 0;
-      raceSearching = true;
-      raceAimCount  = 0;
+  #if DEBUG_SERIAL
+    Serial.print(F("[RACE] 收集成功：上次最短 "));
+    Serial.print(lastScanMin);
+    Serial.print(F("cm -> 本次 "));
+    if (scanMin == 0) { Serial.print(F("无目标")); }
+    else              { Serial.print(scanMin); Serial.print(F("cm")); }
+    Serial.println();
+  #endif
+    lastScanMin   = 0;              // 复位，下一轮重新建基准
+    raceSearching = true;
+    raceAimCount  = 0;
+    raceMissCount = 0;
 
-      buzzPlay(SEQ_PICK, SEQ_PICK_N);
-      dogServoWrite(90);
-      dogTurn(dogTurn180Ms(), +1, DOG_SCAN);
-      return;
-    }
+    buzzPlay(SEQ_PICK, SEQ_PICK_N);
+    dogServoWrite(90);
+    dogTurn(dogTurn180Ms(), +1, DOG_SCAN);   // 蜂鸣 + 180° 换方向继续找
+    return;
+  }
 
+  lastScanMin = scanMin;            // 更新基准（每轮停下扫描都更新）
+
+  /* ---------- 这一轮没有 80cm 内的目标 → 逆时针转 90° 接着找 ---------- */
+  if (scanMin == 0)
+  {
     raceSearching = true;
     if (raceMissCount < 255) { raceMissCount++; }
 
     if (raceMissCount >= RACE_SEARCH_MAX)
     {
-      raceMissCount = 0;                    // 报完警重新数，继续找（不停死）
+      raceMissCount = 0;            // 报完警重新数，继续找（不停死）
       buzzPlay(SEQ_ALARM, SEQ_ALARM_N);
     #if DEBUG_SERIAL
       Serial.println(F("[RACE] 连转 8 次仍无 80cm 内目标 -> 报警"));
@@ -1995,19 +2012,19 @@ void raceDecide(uint32_t t)
     }
 
     dogStreak = 0;
-    /* 逆时针（side = -1）转 90°。用 90° 而不是 0.5s：
-     * 0.5s≈145°，配 ±60° 视野会留 25° 缺口，小方块正好落进去就漏了。 */
+    /* 逆时针（side=-1）转 90°：0.5s≈145°，配 ±60° 视野会留 25° 缺口，
+     * 小方块正好落进去就漏了。90° 步长才和视野重叠。 */
     dogTurn(turnMsFor(RACE_SEARCH_TURN_DEG), -1, DOG_SCAN);
     return;
   }
 
-  /* ---------- ② 刚锁定目标：建立本轮的距离基准 ---------- */
+  /* ---------- 刚锁定目标 ---------- */
   if (raceSearching)
   {
     raceSearching = false;
-    raceBestCm    = dogTargetCm;
     raceMissCount = 0;
     raceAimCount  = 0;
+    aimLastIdx    = -1;
   #if DEBUG_SERIAL
     Serial.print(F("[RACE] 锁定 "));
     Serial.print(scanAngles[dogTargetIdx]);
@@ -2017,52 +2034,10 @@ void raceDecide(uint32_t t)
   #endif
   }
 
-  /* ---------- ③ 收集判定 ----------
-   * ★ 必须用「折算到正前方的等效距离」来比，不能直接用原始读数：
-   *   目标偏 θ 角时读到的是斜距 d/cosθ，车只是走歪了距离也会变大
-   *   （20cm 的目标偏到 45° 就读成 28.3cm，凭空多 8.3cm，正好越过阈值）。
-   *   两边都折算回正前方，才不会把"走歪"误判成"收到了"。
-   * 另外必须「曾接近过」，否则刚开始追就判收集。 */
-  const int16_t offNow = (int16_t)scanAngles[dogTargetIdx] - 90;
-  const int16_t magNow = (offNow < 0) ? (int16_t)(-offNow) : offNow;
-  const uint16_t effNow = effCm(dogTargetCm, magNow);
-
-  if (raceBestCm > 0 && raceBestCm <= RACE_NEAR_CM &&
-      effNow >= (uint16_t)(raceBestCm + RACE_RISE_CM))
-  {
-  #if DEBUG_SERIAL
-    Serial.print(F("[RACE] 收集成功：最近 "));
-    Serial.print(raceBestCm);
-    Serial.print(F("cm -> 现在 "));
-    Serial.print(dogTargetCm);
-    Serial.print(F("cm("));
-    Serial.print(magNow);
-    Serial.print(F("度, 折算 "));
-    Serial.print(effNow);
-    Serial.println(F("cm)"));
-  #endif
-    raceBestCm    = 0;
-    raceSearching = true;
-    raceAimCount  = 0;
-
-    buzzPlay(SEQ_PICK, SEQ_PICK_N);
-    dogServoWrite(90);
-    dogTurn(dogTurn180Ms(), +1, DOG_SCAN);   // 换相反方向继续找
-    return;
-  }
-
-  if (raceBestCm == 0 || effNow < raceBestCm) { raceBestCm = effNow; }
-
-  /* ---------- ④ 对准 ---------- */
+  /* ---------- 对准 ---------- */
   const int16_t off = (int16_t)scanAngles[dogTargetIdx] - 90;
   const int16_t mag = (off < 0) ? (int16_t)(-off) : off;
 
-  /* 已在 ±15° 内（75~105°），或者微调次数用完了 → 前进。
-   * 微调用完还硬转没意义：走一步视角就变了，通常比原地死磕更快对上。 */
-  /* 已在 ±15° 内，或者微调次数用完 → 进入"正前方确认"。
-   * ★ 不直接走：目标在 105° 档（偏 15°）时，斜着能看到不代表正前方有它。
-   *   超声波锥角约 15°，偏 15° 的目标正好在视野边缘，车直着开过去
-   *   很容易从它旁边擦过。所以必须回中实测一发再决定。 */
   if (mag <= RACE_DEAD_DEG || raceAimCount >= RACE_AIM_MAX)
   {
     raceAimCount = 0;
@@ -2070,11 +2045,11 @@ void raceDecide(uint32_t t)
     /* 按距离分级（用户 2026-11-17 定）：
      *   远目标（>20cm）：75~105° 内直接走。远距离偏 15° 时物块仍在正前方
      *                    视野里，走一段还能再修；每次都回中确认太慢。
-     *   近目标（≤20cm）：必须回中实测。这时候差一点角度就真的擦肩而过，
-     *                    而且超声盲区就在眼前，斜着读到的值很不可靠。 */
+     *   近目标（≤20cm）：必须回中实测。这时差一点角度就真擦肩而过，
+     *                    而且盲区就在眼前，斜着读到的值不可靠。 */
     if (dogTargetCm > RACE_CONFIRM_NEAR_CM)
     {
-      dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
+      dogGo(RACE_GO_MS);
       return;
     }
 
@@ -2263,7 +2238,7 @@ void dogStart(uint8_t mode)
 
   /* 比赛模式的搜索/对准/收集状态复位 */
   raceSearching = true;
-  raceBestCm    = 0;
+  lastScanMin   = 0;
   raceMissCount = 0;
   raceAimCount  = 0;
 
@@ -2299,16 +2274,18 @@ void dogStart(uint8_t mode)
   {
     Serial.print(F("  只认 "));
     Serial.print(RACE_MAX_CM);
-    Serial.print(F("cm 内；找 8 次报警；对准 4 次；每次走 "));
+    Serial.print(F("cm 内；找 "));
+    Serial.print(RACE_SEARCH_MAX);
+    Serial.print(F(" 次报警；对准 "));
+    Serial.print(RACE_AIM_MAX);
+    Serial.print(F(" 次；每次走 "));
     Serial.print(RACE_GO_MS);
     Serial.println(F("ms"));
     Serial.print(F("  扫描 "));
     Serial.print(scanN);
-    Serial.print(F(" 档 / 15 度   贴近 "));
-    Serial.print(RACE_PUSH_CM);
-    Serial.print(F("cm 多推 "));
-    Serial.print(RACE_OVERRUN_MS);
-    Serial.println(F("ms"));
+    Serial.print(F(" 档 / 15 度   收集判定：最短距离回升 >"));
+    Serial.print(RACE_COLLECT_RISE_CM);
+    Serial.println(F("cm"));
   }
   else
   {
@@ -2519,7 +2496,7 @@ void serviceDog()
 
       if (ok)
       {
-        if (raceBestCm == 0 || d < raceBestCm) { raceBestCm = d; }
+        if (lastScanMin == 0 || d < lastScanMin) { lastScanMin = d; }
       #if DEBUG_SERIAL
         Serial.print(F("[RACE] 正前方确认 OK "));
         Serial.print(d);
@@ -2552,29 +2529,6 @@ void serviceDog()
       break;
     }
 
-    // ---- 走完一段：快速测一发，决定继续走还是重扫 --------------------------
-    case DOG_QUICK:
-    {
-      if ((uint32_t)(t - dogPhaseMs) < 60) { break; }
-
-      const uint16_t d = dogMeasure();
-
-      /* 还在稳定接近（比这段刚结束时又近了 3cm 以上）且没到 8cm → 再来一段。
-       * 正常前进就是"走 400ms + 测 60ms"的循环，只有真出问题才付一次 1.4 秒全扫。 */
-      if (d != 0 && d > RACE_PUSH_CM && (uint16_t)(d + 3) <= dogQuickRefCm)
-      {
-        if (raceBestCm == 0 || d < raceBestCm) { raceBestCm = d; }
-        dogGo(dogMode == MODE_RACE ? RACE_GO_MS : DOG_GO_MS);
-        break;
-      }
-
-      dogIdx     = 0;
-      scanFwd    = !scanFwd;
-      dogPhase   = DOG_SCAN;
-      dogPhaseMs = t;
-      break;
-    }
-
     // ---- 旋转中 ----------------------------------------------------------
     case DOG_TURN:
       if ((uint32_t)(t - dogPhaseMs) >= dogHoldMs)
@@ -2599,19 +2553,6 @@ void serviceDog()
         dogIdx = 0;
         dogTurn(dogTurn180Ms(), +1, DOG_SCAN);   // 贴到 5cm 了 → 掉头换方向
       }
-      else if (dogAfter == DOG_TURN_AROUND)
-      {
-        /* 比赛：收集完成（这一趟确实推到东西了）。
-         * 响一声告诉人"收了一个"，同时原地转 180° 换到相反方向继续找。
-         * 蜂鸣是非阻塞的，转向期间正好播完。 */
-        buzzPlay(SEQ_PICK, SEQ_PICK_N);
-        raceBestCm    = 0;          // 换方向了，距离基准作废
-        raceSearching = true;
-        raceAimCount  = 0;
-        dogIdx = 0;
-        dogTurn(dogTurn180Ms(), +1, DOG_SCAN);
-
-      }
       else
       {
         dogIdx     = 0;
@@ -2623,82 +2564,23 @@ void serviceDog()
     // ---- 前进中 ----------------------------------------------------------
     case DOG_GO:
     {
-      /* ================= 比赛模式 =================
-       * 和遛狗最大的不同：**贴到东西也不停**。
-       * 车底有一张网，物块比底盘还矮，一旦被推进底盘就落进超声波的盲区，
-       * 于是"看不见了" —— 这正是我们要的，车可以继续收集下一个。
-       * 所以贴近后不但不停，还要**再多推一段**（RACE_OVERRUN_MS），
-       * 确保物块真的被兜进去，而不是刚好卡在边缘。 */
+      /* ================= 比赛模式：纯计时前进 =================
+       * 用户 2026-11-17 要求删掉中途所有判断：
+       *   原来有「连续 3 次不变近就提前刹车」「贴到 8cm 多推 1200ms」
+       *   「走满后 60ms 快确认」，现在全部删除。
+       * 现在只做一件事：走满 RACE_GO_MS 就刹住，然后全扫一轮。
+       * 收集与否改成扫描层面的判断 —— 相邻两次停下扫描的最短距离
+       * 回升超过 RACE_COLLECT_RISE_CM(40cm)，见 raceDecide 开头。 */
       if (dogMode == MODE_RACE)
       {
-        if ((uint32_t)(t - dogCheckMs) >= DOG_GO_CHECK_MS)
-        {
-          dogCheckMs = t;
-          const uint16_t d = dogMeasure();
-
-          if (d != 0)
-          {
-            dogFrontCm = d;
-
-            /* 距离不再变小 → 走歪了，或者正在从物块旁边擦过去。
-             * 提前结束这一段比走满 400ms 再发现要好。 */
-            if (dogLastCm > 0 && (uint16_t)(d + 2) >= dogLastCm)
-            {
-              if (dogNoDown < 255) { dogNoDown++; }
-            }
-            else { dogNoDown = 0; }
-            dogLastCm = d;
-
-            if (d <= RACE_PUSH_CM && !dogPushDone)
-            {
-              dogPushDone = true;
-              dogHoldMs  += RACE_OVERRUN_MS;     // 这一段多走一会儿，把物块顶进底盘
-            #if DEBUG_SERIAL
-              Serial.print(F("[RACE] 贴到 "));
-              Serial.print(d);
-              Serial.print(F("cm，继续推 "));
-              Serial.print(RACE_OVERRUN_MS);
-              Serial.println(F("ms 把物块兜进底盘"));
-            #endif
-            }
-            else if (!dogPushDone && dogNoDown >= RACE_STALL_N && d < 45)
-            {
-              /* ★ 必须排除"正在推"的情况：推物块时距离本来就不变，
-               *   不排除的话 overrun 的 1200ms 会在 150ms 内被判"不再变小"
-               *   直接腰斩，物块根本推不进去（2026-11-17 实测踩到）。 */
-              dogHoldMs = 0;                      // 立刻结束这一段
-            #if DEBUG_SERIAL
-              Serial.print(F("[RACE] 距离不再变小("));
-              Serial.print(d);
-              Serial.println(F("cm)，提前结束这一段"));
-            #endif
-            }
-          }
-        }
-
         if ((uint32_t)(t - dogPhaseMs) < dogHoldMs) { break; }
 
         brakeCar();
         dogStreak  = 0;
-
-        if (dogPushDone)
-        {
-          /* 推满了 → 停稳后蜂鸣 + 180° 换方向 */
-          dogAfter = DOG_TURN_AROUND;
-          dogPhase = DOG_PAUSE;
-        }
-        else
-        {
-          /* 只是走满一段（或被提前叫停）→ 先花 60ms 快测一发，
-           * 还在接近就继续走，别立刻付一次 1.4 秒的全扫。 */
-          dogQuickRefCm = dogFrontCm;
-          dogPhase      = DOG_QUICK;
-        }
+        dogIdx     = 0;
+        scanFwd    = !scanFwd;      // 下一轮反向扫（蛇形）
+        dogPhase   = DOG_SCAN;
         dogPhaseMs = t;
-      #if DEBUG_SERIAL
-        if (dogPushDone) { Serial.println(F("[RACE] 推满，刹车等停稳再掉头")); }
-        else             { Serial.println(F("[RACE] 走满 1s，回扫描确认方向")); }
-      #endif
         break;
       }
 
