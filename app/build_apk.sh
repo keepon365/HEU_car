@@ -64,11 +64,32 @@ PY
 
 echo "[3/6] 编译 Java (javac)"
 find "$APP/src" -name "*.java" | while read -r f; do cygpath -w "$f"; done > "$B/sources.txt"
+
+# ★ javac 的退出码必须检查，不能只看某个 class 有没有生成。
+#   2026-11-17 踩过：Updater.java 有个变量重名错误，javac 失败但已部分产出，
+#   MainActivity.class 照样存在 → 构建继续 → 打出的 dex 缺 Updater.class
+#   → 手机装上直接闪退，而且 version.json 还报了新版本号。
 set +e
 "$JDK/javac.exe" -J-Duser.language=en -J-Duser.country=US -encoding UTF-8 \
   -classpath "$AJAR" -d "$B/classes" @"$B/sources.txt" 2>&1 | grep -v "^Note:"
+JC=${PIPESTATUS[0]}
 set -e
-test -f "$B/classes/com/zyar20a/irremote2/MainActivity.class" || { echo "编译失败"; exit 1; }
+if [ "$JC" -ne 0 ]; then
+  echo "✗ javac 编译失败（exit $JC），构建中止，不生成 APK/version.json"
+  exit 1
+fi
+
+# 再逐个数一遍：每个 .java 都必须有同名 .class，缺一个就说明编译不完整
+# 注意 sources.txt 里是 cygpath -w 出来的**反斜杠**路径，先统一成正斜杠再截取
+MISSING=0
+while read -r f; do
+  cls="$(echo "$f" | sed 's|\\|/|g; s|.*/src/||; s|\.java$|.class|')"
+  if [ ! -f "$B/classes/$cls" ]; then echo "✗ 缺少 $cls"; MISSING=1; fi
+done < "$B/sources.txt"
+if [ "$MISSING" -ne 0 ]; then
+  echo "✗ 有源文件没编译成 class，构建中止"
+  exit 1
+fi
 
 echo "[4/6] 转 dex (d8)"
 find "$B/classes" -name "*.class" | while read -r f; do cygpath -w "$f"; done > "$B/classes.txt"

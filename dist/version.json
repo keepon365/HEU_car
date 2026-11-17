@@ -1,7 +1,7 @@
 {
-  "versionCode": 9,
-  "versionName": "2.7",
-  "note": "修复更新下载到旧包的问题：下载后校验APK内的versionCode，不符则丢弃并提示；加缓存破除参数；本地旧包不再复用",
-  "size": 41761,
-  "md5": "25e7f5efd0de453a3f4259bd868e7cf1"
+  "versionCode": 10,
+  "versionName": "2.8",
+  "note": "修复 v2.7 装上后闪退：javac 编译失败被构建脚本吞掉，打出了缺 Updater.class 的 dex。构建现在会硬中断，并校验每个源文件都编译出 class",
+  "size": 45857,
+  "md5": "4e69e03cb690e366203b96ef86eb5b2a"
 }

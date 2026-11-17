@@ -184,10 +184,14 @@ public class Updater {
                      *   然后系统安装器拒绝 —— 用户看到的就是
                      *   "点了更新却说已安装更高版本"（2026-11-17 实际踩到）。 */
                     if (expectCode > 0) {
-                        final int got = apkVersionCode(c, out);
-                        if (got != expectCode) {
+                        /* ★ 变量名不要叫 got —— 上面「已下载字节数」那个 long got 还在作用域里，
+                         *   重名会让 javac 报 "variable got is already defined"，
+                         *   而 build_apk.sh 当时没检查 javac 退出码，于是打出了一个
+                         *   缺 Updater.class 的 dex，App 装上直接闪退（2026-11-17）。 */
+                        final int apkCode = apkVersionCode(c, out);
+                        if (apkCode != expectCode) {
                             out.delete();
-                            throw new Exception("下载到的是 v" + got + "，不是 v" + expectCode
+                            throw new Exception("下载到的是 v" + apkCode + "，不是 v" + expectCode
                                     + "（镜像缓存还没刷新，稍等几分钟再试）");
                         }
                     }
