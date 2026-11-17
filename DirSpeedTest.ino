@@ -564,16 +564,28 @@ const uint8_t PIN_BUZZ = A3;
 struct BuzzStep { uint16_t freq; uint16_t ms; };   // freq = 0 表示静音段
 
 /* 启动：两声上行    结束：一声低    收集完成：三声急促 */
-const BuzzStep SEQ_START[] = { { 1000, 90 }, { 1500, 130 } };
-const BuzzStep SEQ_STOP[]  = { { 520, 240 } };
-const BuzzStep SEQ_PICK[]  = { { 1600, 60 }, { 0, 35 }, { 1600, 60 }, { 0, 35 }, { 2000, 100 } };
+const BuzzStep SEQ_START[] PROGMEM = { { 1000, 90 }, { 1500, 130 } };
+const BuzzStep SEQ_STOP[]  PROGMEM = { { 520, 240 } };
+const BuzzStep SEQ_PICK[]  PROGMEM = { { 1600, 60 }, { 0, 35 }, { 1600, 60 }, { 0, 35 }, { 2000, 100 } };
 /* 找不到目标时的报警：响 0.5s、停 0.3s，共三次 */
-const BuzzStep SEQ_ALARM[] = { { 1800, 500 }, { 0, 300 }, { 1800, 500 }, { 0, 300 }, { 1800, 500 } };
+const BuzzStep SEQ_ALARM[] PROGMEM = { { 1800, 500 }, { 0, 300 }, { 1800, 500 }, { 0, 300 }, { 1800, 500 } };
 
 #define SEQ_START_N  (uint8_t)(sizeof(SEQ_START) / sizeof(SEQ_START[0]))
 #define SEQ_STOP_N   (uint8_t)(sizeof(SEQ_STOP)  / sizeof(SEQ_STOP[0]))
 #define SEQ_PICK_N   (uint8_t)(sizeof(SEQ_PICK)  / sizeof(SEQ_PICK[0]))
 #define SEQ_ALARM_N  (uint8_t)(sizeof(SEQ_ALARM) / sizeof(SEQ_ALARM[0]))
+
+/* ★ 音序表全部放在 Flash（PROGMEM）：曲谱 154 项 × 4 字节 = 616 字节，
+ *   放 RAM 会把占用顶到 75%，Serial 缓冲和函数栈就没地方了。
+ *   读 PROGMEM 必须用 pgm_read_word，直接下标访问只会读到垃圾。 */
+static inline uint16_t bsFreq(const BuzzStep *p, uint8_t i)
+{
+  return pgm_read_word((const uint16_t *)p + (uint16_t)i * 2u);
+}
+static inline uint16_t bsMs(const BuzzStep *p, uint8_t i)
+{
+  return pgm_read_word((const uint16_t *)p + (uint16_t)i * 2u + 1u);
+}
 
 const BuzzStep *buzzSeq     = 0;
 uint8_t  buzzLen     = 0;
@@ -593,15 +605,15 @@ uint32_t buzzPlay(const BuzzStep *seq, uint8_t n)
   buzzPos = 0;
 
   const uint32_t now = micros();
-  const BuzzStep &s = seq[0];
-  buzzStepEnd = now + (uint32_t)s.ms * 1000UL;
-  buzzHalfUs  = (s.freq == 0) ? 0 : (uint16_t)(500000UL / s.freq);
+  const uint16_t f0 = bsFreq(seq, 0);
+  buzzStepEnd = now + (uint32_t)bsMs(seq, 0) * 1000UL;
+  buzzHalfUs  = (f0 == 0) ? 0 : (uint16_t)(500000UL / f0);
   buzzToggle  = now;
   buzzHigh    = false;
   digitalWrite(PIN_BUZZ, LOW);
 
   uint32_t total = 0;
-  for (uint8_t i = 0; i < n; i++) { total += seq[i].ms; }
+  for (uint8_t i = 0; i < n; i++) { total += bsMs(seq, i); }
   return total;
 }
 
@@ -638,30 +650,166 @@ void buzzStop()
 #define MUS_CS5  554
 #define MUS_D5   587
 
-#define MT 130          // 单个音时长（ms）
+#define N16        150     // 十六分音符（原曲 100BPM、4/4）
+#define N8         300     // 八分音符
+#define REST_SHORT  90     // 每 4 个音后的短气口，没这个就是一片连着的嘟嘟声
+#define REST_LONG  300     // 乐句之间的停顿
 
-const BuzzStep MUSIC_PVZ[] = {
-  // 主题动机 ×3
-  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
-  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
-  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
-  // 上行句
-  {MUS_A4,MT},{MUS_AS4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D4,MT},{MUS_CS4,MT},{MUS_D4,MT},
-  {MUS_G4,MT},{MUS_AS4,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_G5,MT},{MUS_AS4,MT},
-  // 主题动机
-  {MUS_CS5,MT},{MUS_D5,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D5,MT},{MUS_G4,MT},
-  // 长句 ×2
-  {MUS_A4,MT},{MUS_AS4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D4,MT},{MUS_CS4,MT},{MUS_D4,MT},
-  {MUS_G4,MT},{MUS_AS4,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_G5,MT},{MUS_AS4,MT},
-  {MUS_G5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_F5,MT},{MUS_DS5,MT},{MUS_D5,MT},
-  {MUS_A4,MT},{MUS_FS4,MT},{MUS_A4,MT},{MUS_DS5,MT},{MUS_D5,MT},
-  {MUS_A4,MT},{MUS_AS4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_D4,MT},{MUS_CS4,MT},{MUS_D4,MT},
-  {MUS_G4,MT},{MUS_AS4,MT},{MUS_CS5,MT},{MUS_D5,MT},{MUS_G5,MT},{MUS_AS4,MT},
-  {MUS_G5,MT},{MUS_D5,MT},{MUS_AS4,MT},{MUS_G4,MT},{MUS_F5,MT},{MUS_DS5,MT},{MUS_D5,MT},
-  {MUS_A4,MT},{MUS_FS4,MT},{MUS_A4,MT},{MUS_DS5,MT},{MUS_D5,MT},
-  // 收尾
-  {MUS_D5,MT},{MUS_DS5,MT},{MUS_D5,MT},{MUS_DS5,MT},{MUS_D5,MT},{MUS_C5,MT},{MUS_AS4,MT},
-  {MUS_FS4,MT},{MUS_G4,MT},{MUS_G4,MT},{MUS_A4,MT},{MUS_AS4,MT},{MUS_D5,MT*2}
+const BuzzStep MUSIC_PVZ[] PROGMEM = {
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {0,REST_SHORT},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {0,REST_SHORT},
+  {MUS_D5,N16},
+  {MUS_G4,N8},
+  {0,REST_LONG},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {0,REST_SHORT},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {0,REST_SHORT},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {MUS_D5,N16},
+  {MUS_G4,N8},
+  {0,REST_LONG},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {0,REST_SHORT},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {0,REST_SHORT},
+  {MUS_D5,N16},
+  {MUS_G4,N8},
+  {0,REST_LONG},
+  {MUS_A4,N16},
+  {MUS_AS4,N16},
+  {0,REST_SHORT},
+  {MUS_A4,N16},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {MUS_D4,N16},
+  {0,REST_SHORT},
+  {MUS_CS4,N16},
+  {MUS_D4,N16},
+  {MUS_G4,N16},
+  {MUS_AS4,N8},
+  {0,REST_LONG},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {MUS_G5,N16},
+  {MUS_AS4,N16},
+  {0,REST_SHORT},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {0,REST_SHORT},
+  {MUS_AS4,N16},
+  {MUS_G4,N8},
+  {0,REST_LONG},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {0,REST_SHORT},
+  {MUS_D5,N16},
+  {MUS_G4,N16},
+  {MUS_A4,N16},
+  {MUS_AS4,N16},
+  {0,REST_SHORT},
+  {MUS_A4,N16},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {MUS_D4,N8},
+  {0,REST_LONG},
+  {MUS_CS4,N16},
+  {MUS_D4,N16},
+  {MUS_G4,N16},
+  {MUS_AS4,N16},
+  {0,REST_SHORT},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {MUS_G5,N16},
+  {MUS_AS4,N16},
+  {0,REST_SHORT},
+  {MUS_G5,N16},
+  {MUS_D5,N8},
+  {0,REST_LONG},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {0,REST_SHORT},
+  {MUS_F5,N16},
+  {MUS_DS5,N16},
+  {MUS_D5,N16},
+  {MUS_A4,N16},
+  {0,REST_SHORT},
+  {MUS_FS4,N16},
+  {MUS_A4,N16},
+  {MUS_DS5,N16},
+  {MUS_D5,N8},
+  {0,REST_LONG},
+  {MUS_A4,N16},
+  {MUS_AS4,N16},
+  {MUS_A4,N16},
+  {MUS_AS4,N16},
+  {0,REST_SHORT},
+  {MUS_G4,N16},
+  {MUS_D4,N16},
+  {MUS_CS4,N16},
+  {MUS_D4,N16},
+  {0,REST_SHORT},
+  {MUS_G4,N16},
+  {MUS_AS4,N8},
+  {0,REST_LONG},
+  {MUS_CS5,N16},
+  {MUS_D5,N16},
+  {0,REST_SHORT},
+  {MUS_G5,N16},
+  {MUS_AS4,N16},
+  {MUS_G5,N16},
+  {MUS_D5,N16},
+  {0,REST_SHORT},
+  {MUS_AS4,N16},
+  {MUS_G4,N16},
+  {MUS_F5,N16},
+  {MUS_DS5,N8},
+  {0,REST_LONG},
+  {MUS_D5,N16},
+  {MUS_A4,N16},
+  {MUS_FS4,N16},
+  {MUS_A4,N16},
+  {0,REST_SHORT},
+  {MUS_DS5,N16},
+  {MUS_D5,N16},
+  {MUS_D5,N16},
+  {MUS_DS5,N16},
+  {0,REST_SHORT},
+  {MUS_D5,N16},
+  {MUS_DS5,N8},
+  {0,REST_LONG},
+  {MUS_D5,N16},
+  {MUS_C5,N16},
+  {0,REST_SHORT},
+  {MUS_AS4,N16},
+  {MUS_FS4,N16},
+  {MUS_G4,N16},
+  {MUS_G4,N16},
+  {0,REST_SHORT},
+  {MUS_A4,N16},
+  {MUS_AS4,N16},
+  {MUS_D5,N16}
 };
 #define PVZ_N (uint8_t)(sizeof(MUSIC_PVZ) / sizeof(MUSIC_PVZ[0]))
 
@@ -717,9 +865,9 @@ void serviceBuzzer()
     buzzPos++;
     if (buzzPos >= buzzLen) { buzzSeq = 0; buzzHalfUs = 0; return; }
 
-    const BuzzStep &s = buzzSeq[buzzPos];
-    buzzStepEnd = now + (uint32_t)s.ms * 1000UL;
-    buzzHalfUs  = (s.freq == 0) ? 0 : (uint16_t)(500000UL / s.freq);
+    const uint16_t f = bsFreq(buzzSeq, buzzPos);
+    buzzStepEnd = now + (uint32_t)bsMs(buzzSeq, buzzPos) * 1000UL;
+    buzzHalfUs  = (f == 0) ? 0 : (uint16_t)(500000UL / f);
     buzzToggle  = now;
     return;
   }
