@@ -1099,7 +1099,14 @@ uint32_t dogGoStartMs  = 0;           // 这一串「连续前进」的起点（
  * 必须声明在 setWheels() 之前 —— 它要让转圈也走"直给满速"，别被加速曲线拖住。 */
 uint8_t  beaconPhase = 0;
 uint32_t beaconUntil = 0;
-uint8_t  dogIdx        = 0;           // 扫描进度
+uint8_t  dogIdx        = 0;           // 扫描进度（第几个，与角度无关）
+/* ---- 蛇形扫描 ----
+ * 一轮从 150° 扫到 30°，下一轮直接接着从 30° 扫回 150°，
+ * 而不是先空跑 120° 回 150 再扫。
+ * ★ dogIdx 只表示"第几个"，真正的角度索引是 scanCur：
+ *   dogProf[]/dogMove[] 必须**始终按角度排序**，否则选目标和地图会错位。 */
+bool     scanFwd       = true;        // true = 本轮从 index 0 扫到 N-1
+uint8_t  scanCur       = 0;           // 当前档位在 scanAngles 里的真实下标
 uint8_t  dogLost       = 0;           // 连续无回波计数
 uint32_t dogHoldMs     = 0;           // TURN / GO 要持续多久
 uint32_t dogCheckMs    = 0;           // GO 阶段上次测前方的时刻
@@ -1801,6 +1808,30 @@ void raceDecide(uint32_t t)
   /* ---------- ① 这一轮有没有 80cm 内的目标 ---------- */
   if (dogTargetIdx < 0 || dogTargetCm > RACE_MAX_CM)
   {
+    /* ★ 先判"是不是刚收完"：物块进底盘之后的结局有两种 ——
+     *     a) 探头前方还有别的东西 → 最近距离**回升**（主路径，见下面 ③）
+     *     b) 探头水平、前方空旷   → 正前方**直接无回波**，目标从 dogProf 里消失，
+     *        dogTargetIdx 变 -1
+     *   不补这一条，(b) 会被当成"这一圈没目标"直接转 90° 走开，
+     *   收集判定被绕过，物块白收。
+     *   所以：追过一个很近的目标、它现在不见了 → 也判定收集成功。 */
+    if (!raceSearching && raceBestCm > 0 && raceBestCm <= RACE_NEAR_CM)
+    {
+    #if DEBUG_SERIAL
+      Serial.print(F("[RACE] 收集成功：目标消失（最近 "));
+      Serial.print(raceBestCm);
+      Serial.println(F("cm）"));
+    #endif
+      raceBestCm    = 0;
+      raceSearching = true;
+      raceAimCount  = 0;
+
+      buzzPlay(SEQ_PICK, SEQ_PICK_N);
+      dogServoWrite(90);
+      dogTurn(dogTurn180Ms(), +1, DOG_SCAN);
+      return;
+    }
+
     raceSearching = true;
     if (raceMissCount < 255) { raceMissCount++; }
 
@@ -2014,6 +2045,7 @@ void dogStart(uint8_t mode)
   dogStartMs      = nowMs();
   dogPhaseMs      = nowMs();
   dogIdx          = 0;
+  scanFwd         = true;
   dogLost         = 0;
   dogStreak       = 0;
   dogTargetIdx    = -1;
@@ -2142,7 +2174,21 @@ void serviceDog()
 
     // ---- 把舵机转到这一档 ------------------------------------------------
     case DOG_SCAN:
-      dogServoWrite(scanAngles[dogIdx]);
+      /* 蛇形：正向从 0 往后，反向从 N-1 往前。这样上一轮停在 30°，
+       * 这一轮第一档就是 30°，舵机不用空跑回 150°。 */
+      scanCur = scanFwd ? dogIdx : (uint8_t)(scanN - 1 - dogIdx);
+    #if DEBUG_SERIAL
+      if (dogIdx == 0)
+      {
+        Serial.print(F("[DOG] 扫描 "));
+        Serial.print(scanFwd ? F("正向 ") : F("反向 "));
+        Serial.print(scanAngles[scanCur]);
+        Serial.print('-');
+        Serial.print(scanAngles[scanFwd ? (scanN - 1) : 0]);
+        Serial.println(F(" 度"));
+      }
+    #endif
+      dogServoWrite(scanAngles[scanCur]);
       dogSmpIdx = 0; dogSmpMin = 0; dogSmpMax = 0; dogSmpOk = 0;
       dogPhaseMs = t;
       dogPhase   = DOG_MEAS;
@@ -2170,10 +2216,10 @@ void serviceDog()
       if (dogSmpIdx < scanSamples) { break; }   // 本档还没采够，下一拍接着采
 
       // ---- 本档采完：落库 + 判「有没有东西在动」----
-      dogProf[dogIdx] = dogSmpMin;               // 距离取最小值（余波只会让读数偏小）
+      dogProf[scanCur] = dogSmpMin;              // 距离取最小值（余波只会让读数偏小）
       /* 有效读数不足 2 个就没法比，一律当静止 —— 宁可漏判，也别把噪声当目标追。
        * 满足 2 个且「最大-最小 ≥ DOG_MOVE_CM」→ 这个方向有东西在动。 */
-      dogMove[dogIdx] = (dogSmpOk >= 2) &&
+      dogMove[scanCur] = (dogSmpOk >= 2) &&
                         ((uint16_t)(dogSmpMax - dogSmpMin) >= DOG_MOVE_CM);
 
       if (dogSmpOk == 0) { if (dogLost < 255) { dogLost++; } }
@@ -2193,6 +2239,7 @@ void serviceDog()
     #endif
       dogPick();
       dogIdx = 0;
+      scanFwd = !scanFwd;      // 下一轮反向扫，顺手把舵机"回正"掉（蛇形）
 
       if (dogLost >= DOG_LOST_MAX) { dogStop("探头无回波"); return; }
 
