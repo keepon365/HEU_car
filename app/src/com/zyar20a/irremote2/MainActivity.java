@@ -240,8 +240,16 @@ public class MainActivity extends Activity
             log("✓ 更新包已就绪（" + upName + "），点横幅安装");
             // 立刻尝试拉起安装器；缺权限时 Updater 会跳系统设置页
             if (!Updater.install(MainActivity.this)) {
-                setBanner("→  允许「安装未知应用」后，再点这里", true, C_ACCENT);
-                log("需要允许安装未知应用：设置 → 应用 → 本应用 → 安装未知应用");
+                /* 两种可能：没给"安装未知应用"权限，或者包版本不达标被丢掉。
+                 * 后者会把文件删掉，所以横幅改成"点此重下"，别让用户一直点装。 */
+                if (Updater.cachedApkCode(MainActivity.this) < 0) {
+                    upDownloaded = false;
+                    setBanner("✗  更新包版本不对 · 点此重下", true, C_DANGER);
+                    log("✗ 下载到的包版本不达标，已丢弃。镜像可能还没刷新，稍后再点");
+                } else {
+                    setBanner("→  允许「安装未知应用」后，再点这里", true, C_ACCENT);
+                    log("需要允许安装未知应用：设置 → 应用 → 本应用 → 安装未知应用");
+                }
             }
         }
 
@@ -258,20 +266,28 @@ public class MainActivity extends Activity
     {
         if (upBase == null) { return; }
 
-        // 包已在本地：通常是刚被引导去开权限，回来再点一次直接装，不再走网络
+        /* 包已在本地：先确认它确实是"要装的那个版本"。
+         * ★ 不能直接复用 —— 镜像缓存旧包时这里会一直是旧版本，
+         *   点多少次都是"已安装更高版本"，永远下不到新的（2026-11-17 踩到）。 */
         if (upDownloaded || Updater.apkReady(this)) {
-            upDownloaded = true;
-            if (!Updater.install(this)) {
-                setBanner("→  允许「安装未知应用」后，再点这里", true, C_ACCENT);
-                log("请在系统设置里允许安装未知应用，然后回来再点一次横幅");
+            final int local = Updater.cachedApkCode(this);
+            if (local > 0 && upCode > 0 && local != upCode) {
+                log("本地包是 v" + local + "，不是 v" + upCode + "，丢掉重下");
+                upDownloaded = false;                  // 走下面的下载流程
+            } else {
+                upDownloaded = true;
+                if (!Updater.install(this)) {
+                    setBanner("→  允许「安装未知应用」后，再点这里", true, C_ACCENT);
+                    log("请在系统设置里允许安装未知应用，然后回来再点一次横幅");
+                }
+                return;
             }
-            return;
         }
 
         if (upBusy) { return; }        // 连点保护
         upBusy = true;
         setBanner("↓  连接更新源…", false, C_DIM);
-        Updater.download(this, upBase, updateCb);
+        Updater.download(this, upBase, upCode, updateCb);
     }
 
     /* ================= 界面 ================= */

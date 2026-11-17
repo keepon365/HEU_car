@@ -103,9 +103,31 @@ public class Updater {
         }).start();
     }
 
+    /** 读一个 **APK 文件**（不是已安装的包）里面的 versionCode。
+     *  -1 = 读不出来（文件损坏 / 根本不是 APK）。
+     * 这是判断"下载到的到底是不是我要的那个版本"的唯一可靠办法 ——
+     * 只看文件大小和 PK 头是不够的：镜像缓存旧包时两者都正常。 */
+    public static int apkVersionCode(Context c, File f) {
+        try {
+            PackageInfo p = c.getPackageManager()
+                    .getPackageArchiveInfo(f.getAbsolutePath(), 0);
+            return (p == null) ? -1 : p.versionCode;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 本地已下好的安装包版本号（没有文件返回 -1） */
+    public static int cachedApkCode(Context c) {
+        File f = ApkProvider.apkFile(c);
+        if (!f.exists() || f.length() < UpdateConfig.MIN_APK_BYTES) { return -1; }
+        return apkVersionCode(c, f);
+    }
+
     /* ================= 下载 ================= */
 
-    public static void download(final Context c, final String base, final Cb cb) {
+    public static void download(final Context c, final String base,
+                                final int expectCode, final Cb cb) {
         new Thread(new Runnable() {
             @Override public void run() {
                 final File out = ApkProvider.apkFile(c);
@@ -113,7 +135,11 @@ public class Updater {
                 try {
                     if (out.exists()) { out.delete(); }
 
-                    URL u = new URL(base + UpdateConfig.FILE_APK);
+                    /* ★ 带上 ?v=<目标版本>：
+                     *   raw.githubusercontent.com 和镜像都有 CDN 缓存（数分钟），
+                     *   刚推送完就去下，很可能拿到上一个版本的包。
+                     *   换个 URL 就是换一个缓存键，能绕开旧缓存。 */
+                    URL u = new URL(base + UpdateConfig.FILE_APK + "?v=" + expectCode);
                     con = (HttpURLConnection) u.openConnection();
                     con.setConnectTimeout(UpdateConfig.TIMEOUT_MS);
                     con.setReadTimeout(15000);
@@ -153,6 +179,19 @@ public class Updater {
                         throw new Exception("下载内容不是 APK（缺少 PK 头），镜像可能被劫持或返回了网页");
                     }
 
+                    /* ★ 最关键的一道：包里的 versionCode 必须等于清单里说的那个。
+                     *   少了这道，镜像缓存旧包时会被当成"下载成功"，
+                     *   然后系统安装器拒绝 —— 用户看到的就是
+                     *   "点了更新却说已安装更高版本"（2026-11-17 实际踩到）。 */
+                    if (expectCode > 0) {
+                        final int got = apkVersionCode(c, out);
+                        if (got != expectCode) {
+                            out.delete();
+                            throw new Exception("下载到的是 v" + got + "，不是 v" + expectCode
+                                    + "（镜像缓存还没刷新，稍等几分钟再试）");
+                        }
+                    }
+
                     post(new Runnable() {
                         @Override public void run() { cb.onDone(); }
                     });
@@ -183,6 +222,15 @@ public class Updater {
     public static boolean install(Activity a) {
         File f = ApkProvider.apkFile(a);
         if (!f.exists() || f.length() < UpdateConfig.MIN_APK_BYTES) { return false; }
+
+        /* 装之前再确认一次：包里的 versionCode 必须比已装的新。
+         * 否则装到一半被系统拒，用户只会看到一句"已安装更高版本"，无从判断。 */
+        final int inApk = apkVersionCode(a, f);
+        final int mine  = localCode(a);
+        if (inApk > 0 && mine > 0 && inApk <= mine) {
+            f.delete();                    // 旧包直接丢掉，下次会重新下
+            return false;
+        }
 
         if (Build.VERSION.SDK_INT >= 26) {
             boolean ok;
