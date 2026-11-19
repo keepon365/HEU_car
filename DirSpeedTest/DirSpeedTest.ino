@@ -1114,6 +1114,22 @@ void handleSerialCmd()
 {
   cmdBuf[cmdLen] = '\0';
 
+  /* ---- 心跳（App 每 800ms 发一个 '!'）----------------------------------
+   * 为什么要有：蓝牙链路会「假活」—— HC-05 掉电复位后手机上仍然显示已连接、
+   * 发送也不报错，但车一个字都收不到。App 靠「车还回不回话」判断真活，
+   * 所以这里必须立刻回一个标记。
+   *
+   * ★ 必须抢在 runMotion 前面：
+   *   一旦落进 runMotion 的「手动接管」分支，会掐掉音乐、退出自动模式，
+   *   心跳就变成干扰源了。也**不刷新 lastCommandMs** —— 心跳不代表有人在操作，
+   *   不能拿它喂抬手即停的看门狗。
+   * ★ 不用 K/Y/M/N：K 是「转一圈」标定，Y 是转动计时，都会撞。 */
+  if (cmdLen == 1 && cmdBuf[0] == '!')
+  {
+    Serial.println(F("#OK"));
+    return;
+  }
+
   /* ---- 先试运动命令（单字符）----
    * 蓝牙 App 发的就是 F/B/L/R/S/G/P 单个字母。
    * 只拦长度 1：L250 / S1050 / B1 / Q390 这些调试命令照旧往下走。 */
@@ -1346,6 +1362,8 @@ void handleSerialCmd()
 void serviceSerial()
 {
 #if DEBUG_SERIAL
+  static uint32_t cmdLastMs = 0;
+
   while (Serial.available() > 0)
   {
     const char c = (char)Serial.read();
@@ -1356,7 +1374,17 @@ void serviceSerial()
     else if (cmdLen < sizeof(cmdBuf) - 1)
     {
       cmdBuf[cmdLen++] = c;
+      cmdLastMs = nowMs();
     }
+  }
+
+  /* 半截命令超时丢弃（2026-11-19 加）：
+   * 蓝牙偶尔会丢字节、或者换行没送到。cmdBuf 一旦被垃圾字节填满，
+   * 后面的命令就全部因为"缓冲满了"被丢掉，直到碰巧来一个换行 ——
+   * 表现成"车突然对任何命令都不理，只能重启"。300ms 没下文就当没这回事。 */
+  if (cmdLen > 0 && (uint32_t)(nowMs() - cmdLastMs) > 300)
+  {
+    cmdLen = 0;
   }
 #endif
 }

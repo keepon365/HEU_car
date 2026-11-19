@@ -72,24 +72,25 @@ Arduino 会自动生成函数原型，所以作者可以把任意函数放在任
 
 | 函数 | 行 | 作用 |
 |---|---|---|
-| `setup()` | 1498 | 引脚初始化、读 EEPROM、开红外 |
-| `loop()` | 2996 | 主循环：串口 → 红外 → 蜂鸣 → 状态机 → 输出 |
-| `handleSerialCmd()` | 1113 | 串口命令分发（L/R/S/T/W/D/V/X/Z/C/Q/A/M/N/B/G/P） |
-| `setWheels()` | 1753 | 设定左右轮方向 + 占空比（入口） |
-| `buildDuty()` | 1652 | 把"指令值"变成"实际 PWM"（含 TRIM/GAIN 补偿） |
-| `applyOutput()` | 1722 | 真正写 PWM 和方向脚 |
-| `brakeCar()` | 1797 | 刹车（四脚全低 + 使能拉满） |
-| `serviceRamp()` | 1880 | 加速曲线推进（每拍把 currentDuty 往 targetDuty 爬） |
-| `serviceAutoStop()` | 2000 | 抬手即停看门狗 |
-| `dogPick()` | 2086 | 从扫描结果里挑目标 |
-| `raceDecide()` | 2187 | **比赛模式决策**（搜索/对准/收集判定） |
-| `serviceDog()` | 2572 | **自动模式状态机主循环**（按 dogPhase 分派） |
-| `dogServoWrite()` | 2047 | 云台舵机（D12） |
-| `dogMeasure()` | 2055 | 超声波测一次（A0 Trig / A1 Echo） |
-| `dogTurnEx()` | 2322 | 原地旋转（可指定占空比，微调用低速） |
-| `dogGo()` | 2356 | 前进一段 |
-| `dogStart()` / `dogStop()` | 2454 / 2543 | 自动模式启停 |
-| `runMotion()` | 2914 | 红外一帧的解码与分发 |
+| `setup()` | 1526 | 引脚初始化、读 EEPROM、开串口 |
+| `loop()` | 3024 | 主循环：串口 → 蜂鸣 → 状态机 → 输出 |
+| `serviceSerial()` | 1362 | 收串口字节、拼行、半截命令超时丢弃 |
+| `handleSerialCmd()` | 1113 | 串口命令分发（`!` 心跳 / L/R/S/T/W/D/V/X/Z/C/Q/A/M/N/B/G/P） |
+| `setWheels()` | 1781 | 设定左右轮方向 + 占空比（入口） |
+| `buildDuty()` | 1680 | 把"指令值"变成"实际 PWM"（含 TRIM/GAIN 补偿） |
+| `applyOutput()` | 1750 | 真正写 PWM 和方向脚 |
+| `brakeCar()` | 1825 | 刹车（四脚全低 + 使能拉满） |
+| `serviceRamp()` | 1908 | 加速曲线推进（每拍把 currentDuty 往 targetDuty 爬） |
+| `serviceAutoStop()` | 2028 | 抬手即停看门狗 |
+| `dogPick()` | 2114 | 从扫描结果里挑目标 |
+| `raceDecide()` | 2215 | **比赛模式决策**（搜索/对准/收集判定） |
+| `serviceDog()` | 2600 | **自动模式状态机主循环**（按 dogPhase 分派） |
+| `dogServoWrite()` | 2075 | 云台舵机（D12） |
+| `dogMeasure()` | 2083 | 超声波测一次（A0 Trig / A1 Echo） |
+| `dogTurnEx()` | 2350 | 原地旋转（可指定占空比，微调用低速） |
+| `dogGo()` | 2384 | 前进一段 |
+| `dogStart()` / `dogStop()` | 2482 / 2571 | 自动模式启停 |
+| `runMotion()` | 2942 | 运动命令分发（蓝牙单字符） |
 
 ### 引脚分配（改硬件时对照）
 
@@ -111,8 +112,8 @@ Arduino 会自动生成函数原型，所以作者可以把任意函数放在任
 
 | 文件 | 行数 | 作用 |
 |---|---|---|
-| `src/.../MainActivity.java` | 1061 | 界面 + 圆盘 + 按钮 + 蓝牙发送 |
-| `src/.../BtLink.java` | 132 | 经典蓝牙 SPP 连接（配 HC-05） |
+| `src/.../MainActivity.java` | 1214 | 界面 + 圆盘 + 按钮 + 蓝牙发送 + 链路心跳/自动重连 |
+| `src/.../BtLink.java` | 288 | 经典蓝牙 SPP（双向：收行线程 + 写超时守护 + 心跳时间戳） |
 | `src/.../Updater.java` | 318 | 自更新：多镜像下载、版本校验、安装 |
 | `src/.../UpdateConfig.java` | 69 | 更新源地址、文件名常量 |
 | `src/.../ApkProvider.java` | 82 | `content://` 提供者（Android 13+ 装 APK 必须） |
@@ -161,15 +162,29 @@ VCODE=11 VNAME=2.9 NOTE="说明" bash app/build_apk.sh
 
 自动模式的开、关用大小写区分（`G` 开 / `g` 关），各自幂等——重复发一百遍结果一样，丢一帧不会把状态翻过来。
 
+### 心跳（v3.1 加，必须保留）
+
+App 每 800 ms 发一个 `!`，车端立刻回 `#OK`。**3.5 秒收不到回话就判定链路假活**：
+App 主动关 socket（顺带撬开卡住的 `write()`）并自动重连，全程不用碰手机。
+
+为什么需要它：HC-05 一旦掉电复位（电机/舵机同时启动拉垮 5V 最常见），
+Android 这边 `socket.isConnected()` 仍然是 `true`，`write()` 甚至还能"成功"
+—— 界面显示已连接、日志照样打「→ 前进」，车却一个字没收到。
+更糟的是 `write()` 有时直接阻塞不返回，整条发送线程永久挂死，
+之后连"连接设备"都排不进去，表现成**点任何按钮毫无反应**。
+
+所以：心跳不能走 `runMotion`（会被当成手动接管，掐音乐、退自动模式），
+也不能刷新 `lastCommandMs`（心跳不代表有人在操作，不能喂看门狗）。
+
 ---
 
 ## 五、建议的阅读顺序
 
 1. **`遛狗模式.md`** —— 10 分钟，先搞清楚车"想干什么"
 2. **主固件 1 – 270 行** —— 所有参数和它们的含义都在这儿
-3. **`setup()` 1526** 和 **`loop()` 3053** —— 看程序骨架
-4. **`raceDecide()` 2213** + **`serviceDog()` 2598** —— 自动模式的核心
-5. **`setWheels()` 1779 / `buildDuty()` 1678** —— 想知道"为什么左右轮不同步"再看
+3. **`setup()` 1526** 和 **`loop()` 3024** —— 看程序骨架
+4. **`raceDecide()` 2215** + **`serviceDog()` 2600** —— 自动模式的核心
+5. **`setWheels()` 1781 / `buildDuty()` 1680** —— 想知道"为什么左右轮不同步"再看
 
 ---
 

@@ -17,6 +17,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.TypedValue;
@@ -137,6 +138,37 @@ public class MainActivity extends Activity
         }
     };
 
+    /* ================= 链路健康（v3.1，用户实测「过一会儿全没反应」后加的） =================
+     * 蓝牙链路会「假活」：HC-05 一旦掉电复位（电机启动瞬间电压跌落最常见），
+     * Android 这边 socket 仍然 isConnected()==true，write 还往内核缓冲里写得进去，
+     * 于是界面一直显示「已连接」、日志一直「→ 前进」，车却一个字都没收到。
+     * 更糟的是 write 一旦阻塞不返回，整条 bt-tx 线程就永久挂死，
+     * 之后连「连接设备」这个任务都排不进去 —— 表现就是点任何按钮毫无反应。
+     *
+     * 解法只有一条：**以车端回话为准**。
+     *   App 每 800ms 发 '!'，固件立刻回 "#OK"；3.5 秒收不到就判定假活 →
+     *   主动关 socket（撬开卡死的 write）→ 自动重连，全程不用碰手机。 */
+    private static final int  HB_MS            = 800;
+    private static final long HB_TIMEOUT_MS    = 3500;
+    private static final long RECONNECT_GAP_MS = 2500;
+
+    private boolean  reconnecting     = false;
+    private boolean  linkWarned       = false;
+    private long     lastReconnectMs  = 0;
+    private long     lastCarLogMs     = 0;
+    private int      carLogCount      = 0;
+
+    /** 只清这一条，绝不用 removeCallbacksAndMessages(null) ——
+     *  那会把正在排队的「连接设备」任务一起清掉，点按钮就永远连不上。 */
+    private Runnable sendRunnable;
+
+    private final Runnable hbTask = new Runnable() {
+        @Override public void run() {
+            try { heartbeat(); } catch (Throwable ignored) { }
+            ui.postDelayed(this, HB_MS);
+        }
+    };
+
     /* ================= 生命周期 ================= */
 
     @Override
@@ -150,6 +182,24 @@ public class MainActivity extends Activity
         w.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         bt  = new BtLink();
+        bt.setListener(new BtLink.Listener() {
+            @Override public void onLine(final String line) {
+                ui.post(new Runnable() {
+                    @Override public void run() { onCarLine(line); }
+                });
+            }
+            @Override public void onLost(final String why) {
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        if (!linkWarned) {
+                            log("⚠ 链路断开：" + why + "（自动重连中）");
+                        }
+                        linkWarned = true;
+                        renderPill();
+                    }
+                });
+            }
+        });
         vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
 
         txThread = new HandlerThread("bt-tx");
@@ -171,6 +221,9 @@ public class MainActivity extends Activity
 
         // 后台查更新：没网/镜像挂了都只是安静跳过，不影响遥控
         startUpdateCheck();
+
+        // 链路心跳：常驻，断了自己接回去
+        ui.postDelayed(hbTask, HB_MS);
     }
 
     @Override
@@ -334,8 +387,9 @@ public class MainActivity extends Activity
         pill.setClickable(true);
         pill.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
-                if (bt != null && bt.connected()) {
+                if (bt != null && bt.connected() && !linkWarned) {
                     log("已连接 " + bt.deviceLabel());
+                    log("车端心跳正常（" + (bt.msSinceRx() / 1000) + " 秒前刚回话）");
                 } else {
                     pickBtDevice();
                 }
@@ -699,14 +753,15 @@ public class MainActivity extends Activity
         }
         if (tx == null) { log("✗ 发送线程没起来"); return; }
 
-        tx.removeCallbacksAndMessages(null);     // 丢掉积压的旧指令，只发最新这条
-        tx.post(new Runnable() {
+        tx.removeCallbacks(sendRunnable);        // 丢掉积压的旧指令，只发最新这条
+        sendRunnable = new Runnable() {
             @Override public void run() {
-                final boolean ok = bt.send(cmd);
+                final boolean ok = bt == null ? false : bt.send(cmd);
                 ui.post(new Runnable() {
                     @Override public void run() {
                         if (!ok) {
-                            log("✗ 发送失败，连接已断开");
+                            log("✗ 发送失败，链路已断（自动重连）");
+                            linkWarned = true;
                             renderPill();
                         } else if (record) {
                             log("→ " + name + "  [" + cmd + "]");
@@ -714,9 +769,97 @@ public class MainActivity extends Activity
                     }
                 });
             }
-        });
+        };
+        tx.post(sendRunnable);
 
         if (record) { buzz(10); }
+    }
+
+    /* ================= 链路心跳与自动重连 ================= */
+
+    /** 每 800ms 一拍：正常就发心跳，假活就掐断重连 */
+    private void heartbeat()
+    {
+        if (bt == null) { return; }
+
+        if (bt.connected()) {
+            final long idle = bt.msSinceRx();
+
+            if (idle > HB_TIMEOUT_MS) {
+                if (!linkWarned) {
+                    String how = (idle == Long.MAX_VALUE)
+                            ? "从连上到现在一次都没回话"
+                            : (idle / 1000) + " 秒没回话";
+                    log("⚠ 车端" + how + " —— 链路假活，掐断重连");
+                    linkWarned = true;
+                }
+                bt.close(null);          // 关 socket 顺带撬开卡死的 write
+                renderPill();
+                tryReconnect();
+            } else {
+                linkWarned = false;
+                txRaw("!");              // 心跳：不记日志、不震动
+            }
+            return;
+        }
+
+        /* 已经断了：只要记住过设备就自己接回去，不用用户重开 App */
+        if (bt.lastDevice() != null) { tryReconnect(); }
+    }
+
+    /** 后台线程发一条「不记录」的短命令（心跳） */
+    private void txRaw(final String cmd)
+    {
+        if (tx == null || bt == null) { return; }
+        tx.post(new Runnable() {
+            @Override public void run() { bt.send(cmd); }
+        });
+    }
+
+    /** 自动重连。同一时刻只允许一个在跑，失败后隔 2.5 秒再试，永不放弃。 */
+    private void tryReconnect()
+    {
+        if (reconnecting || tx == null || bt == null) { return; }
+
+        final BluetoothDevice dev = bt.lastDevice();
+        if (dev == null) { return; }
+
+        final long now = SystemClock.elapsedRealtime();
+        if (now - lastReconnectMs < RECONNECT_GAP_MS) { return; }
+        lastReconnectMs = now;
+        reconnecting = true;
+        renderPill();                // 立刻显示「重连中」，别让用户以为卡死
+
+        tx.post(new Runnable() {
+            @Override public void run() {
+                final String err = bt.connect(dev);
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        reconnecting = false;
+                        if (err == null) {
+                            linkWarned = false;
+                            log("✓ 链路已恢复 " + bt.deviceLabel());
+                            buzz(20);
+                        } else {
+                            log("✗ 重连失败 " + err + "（自动继续重试）");
+                        }
+                        renderPill();
+                    }
+                });
+            }
+        });
+    }
+
+    /** 车端回话。心跳应答 #OK 只当存活信号；其余是调试信息，限流显示。 */
+    private void onCarLine(String line)
+    {
+        if (line.startsWith("#OK")) { return; }
+
+        final long now = SystemClock.elapsedRealtime();
+        if (now - lastCarLogMs > 1000) { lastCarLogMs = now; carLogCount = 0; }
+        if (carLogCount >= 4) { return; }        // 别把「→ 前进」的记录挤没了
+        carLogCount++;
+        log("车 " + line);
     }
 
     /* ================= 蓝牙连接 ================= */
@@ -732,6 +875,14 @@ public class MainActivity extends Activity
             pill.setBackground(round(0x1AFF5E6C, 0x55FF5E6C, dp(20)));
         } else if (!bt.enabled()) {
             pill.setText("●  蓝牙未开");
+            pill.setTextColor(C_DANGER);
+            pill.setBackground(round(0x1AFF5E6C, 0x55FF5E6C, dp(20)));
+        } else if (reconnecting) {
+            pill.setText("●  重连中");
+            pill.setTextColor(C_RACE);
+            pill.setBackground(round(0x1A4FA8E8, 0x554FA8E8, dp(20)));
+        } else if (bt.connected() && linkWarned) {
+            pill.setText("●  车端无响应");
             pill.setTextColor(C_DANGER);
             pill.setBackground(round(0x1AFF5E6C, 0x55FF5E6C, dp(20)));
         } else if (bt.connected()) {
@@ -784,6 +935,8 @@ public class MainActivity extends Activity
                     @Override public void run() {
                         if (err == null) {
                             log("✓ 已连接 " + bt.deviceLabel());
+                            linkWarned = false;
+                            lastReconnectMs = SystemClock.elapsedRealtime();
                             buzz(30);
                         } else {
                             log("✗ 连接失败 " + err);
