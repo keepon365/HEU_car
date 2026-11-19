@@ -2599,6 +2599,7 @@ void serviceDog()
 {
   if (!dogOn) { return; }
 
+
   const uint32_t t = nowMs();
 
   if ((uint32_t)(t - dogStartMs) >= DOG_MAX_MS) { dogStop("硬超时"); return; }

@@ -1,1 +1,4 @@
+C:\Users\zwm\Desktop\HEU_car\app\src\com\zyar20a\irremote2\ApkProvider.java
 C:\Users\zwm\Desktop\HEU_car\app\src\com\zyar20a\irremote2\MainActivity.java
+C:\Users\zwm\Desktop\HEU_car\app\src\com\zyar20a\irremote2\UpdateConfig.java
+C:\Users\zwm\Desktop\HEU_car\app\src\com\zyar20a\irremote2\Updater.java

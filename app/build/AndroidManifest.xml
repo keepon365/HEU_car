@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zyar20a.irremote2"
+    android:versionCode="10"
+    android:versionName="2.8">
+
+    <uses-permission android:name="android.permission.TRANSMIT_IR" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- 自更新：联网拉 version.json / app.apk -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 8+ 拉起 APK 安装器必须声明，用户仍需手动允许一次 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <uses-feature
+        android:name="android.hardware.consumerir"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 把下载好的 APK 以 content:// 交给系统安装器（绕开 file:// 限制） -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="com.zyar20a.irremote2.apk"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+    </application>
+</manifest>
