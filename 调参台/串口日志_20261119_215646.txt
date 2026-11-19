@@ -1,0 +1,5 @@
+﻿[21:57:21] 已打开 COM10 @ 9600
+[21:57:22] ✗ 发送失败：Exception calling "Write" with "1" argument(s): "The write timed out."
+[21:57:23] 没读到参数行。检查：HC-05 是否已连上、波特率是否 9600、USB 线是否拔了
+[21:57:23] 输入 help 看命令；f 前进 / s 停车 / run 2 直线测试
+[21:57:23] 本次日志同时写到：C:\Users\zwm\Desktop\HEU_car\调参台\串口日志_20261119_215646.txt
