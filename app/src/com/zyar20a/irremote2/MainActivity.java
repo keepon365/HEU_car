@@ -8,7 +8,10 @@ import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.hardware.ConsumerIrManager;
+import android.app.AlertDialog;
+import android.bluetooth.BluetoothDevice;
+import android.content.DialogInterface;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -31,25 +34,28 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * ZYAR20A 红外遥控 · 新版界面
+ * ZYAR20A 蓝牙遥控 · v3.0
  *
- * 键码与车端 DirSpeedTest.ino 的 KEY_TABLE 完全一致，车端一行都不用改。
- * 与旧版的差别只有两处：
- *   1) 松手立刻补发一帧「停车」，不再干等看门狗 —— 这是延迟的主要来源
- *   2) 界面重做：圆盘方向键 + 原地旋转 + 实时日志
+ * 通信从红外改成经典蓝牙（HC-05，SPP 串口透传），发的是单字符命令：
+ *   F 前进  B 后退  L 左旋  R 右旋  S 停  G/g 遛狗开关  P/p 比赛开关
+ *
+ * 与红外版的关键差别：
+ *   · 有连接、有方向：发送失败能立刻知道，而不是猜"车怎么不动"
+ *   · 断连即停：send() 失败会关掉 socket，车端 450ms 看门狗兜底刹车
+ *   · 不再需要连发多帧抗丢包，一条命令发一次就够
  */
 public class MainActivity extends Activity
 {
-    /* ---------- 键码：必须与固件 KEY_TABLE 一致 ---------- */
-    private static final int CODE_FWD   = 0x00FF629D;
-    private static final int CODE_BACK  = 0x00FFA857;
-    private static final int CODE_LEFT  = 0x00FF22DD;   // 单边左转：已废弃，圆盘改发 SPINL
-    private static final int CODE_RIGHT = 0x00FFC23D;   // 单边右转：已废弃，圆盘改发 SPINR
-                                                        // （保留定义，因为固件仍认识这两个码，
-                                                        //   方便以后想恢复"行进中转向"时直接用）
-    private static final int CODE_STOP  = 0x00FF02FD;
-    private static final int CODE_SPINL = 0x00FFE01F;
-    private static final int CODE_SPINR = 0x00FF906F;
+    /* ---------- 动作 ID ----------
+     * 蓝牙改造后这些不再是红外码，只是界面内部的"动作编号"，
+     * 由 cmdOf() 映射成发给车的单个字母。保留名字是为了不动 UI 和轮盘回调。 */
+    private static final int CODE_FWD   = 1;
+    private static final int CODE_BACK  = 2;
+    private static final int CODE_LEFT  = 3;    // 单边左转：已废弃
+    private static final int CODE_RIGHT = 4;    // 单边右转：已废弃
+    private static final int CODE_STOP  = 5;
+    private static final int CODE_SPINL = 6;
+    private static final int CODE_SPINR = 7;
 
     /* ---------- 自动模式：开、关各一个码，车端都是幂等的 ----------
      * ★ 为什么不用"按一下切换"（v2.6 改的，用户实测踩到）：
@@ -58,10 +64,10 @@ public class MainActivity extends Activity
      *   拆成开/关两个码之后，同一条命令发一百遍结果都一样，才能放心连发。
      *     遛狗  开 = 数字键 0      关 = 数字键 1
      *     比赛  开 = 数字键 2      关 = 数字键 3   */
-    private static final int CODE_DOG_ON    = 0x00FF6897;
-    private static final int CODE_DOG_OFF   = 0x00FF30CF;
-    private static final int CODE_RACE_ON   = 0x00FF18E7;
-    private static final int CODE_RACE_OFF  = 0x00FF7A85;
+    private static final int CODE_DOG_ON    = 8;
+    private static final int CODE_DOG_OFF   = 9;
+    private static final int CODE_RACE_ON   = 10;
+    private static final int CODE_RACE_OFF  = 11;
 
     /* ---------- 配色 ---------- */
     private static final int C_BG     = 0xFF080B10;
@@ -73,19 +79,19 @@ public class MainActivity extends Activity
     private static final int C_DIM    = 0xFF7C8B9B;
     private static final int C_DANGER = 0xFFFF5E6C;
 
-    private static final int REPEAT_MS = 200;   // 按住时的重发周期（与旧版一致，单帧 67.5ms）
+    /* 按住时的重发周期。蓝牙是点对点连接、不会像红外那样丢帧，
+     * 80ms 一次足够维持车端 450ms 的看门狗，同时把延迟压到最低。 */
+    private static final int REPEAT_MS = 80;
 
-    /* 接收头带 AGC，第一帧常被吃掉：按下连发 2 帧，维持时 1 帧，
-       松手再补 2 帧停车（车端看门狗 300ms，留足余量） */
-    private static final int FRAMES_FIRST = 2;   // 2 帧 ≈135ms
+    /* 帧数参数保留（调用点没改），蓝牙下只发一次 —— 连接本身可靠。 */
+    private static final int FRAMES_FIRST = 1;
     private static final int FRAMES_KEEP  = 1;
-    private static final int FRAMES_STOP  = 2;
-    private static final int FRAME_GAP_MS = 45;  // 帧间隔，旧版实测值
+    private static final int FRAMES_STOP  = 1;
+    private static final int FRAME_GAP_MS = 0;
 
     private static final int LOG_SHOW  = 9;     // 日志区显示几行
 
-    private ConsumerIrManager ir;
-    private boolean hasIr = false;
+    private BtLink bt;
     private Vibrator vib;
 
     private WheelPad pad;
@@ -118,9 +124,6 @@ public class MainActivity extends Activity
     private HandlerThread txThread;
     private Handler tx;
 
-    private int    carrierHz   = 38000;
-    private String carrierInfo = "";
-
     private int     activeCode      = 0;
     private String  activeName      = "";
     private boolean activeNeedsStop = false;
@@ -146,27 +149,25 @@ public class MainActivity extends Activity
         w.setNavigationBarColor(C_BG);
         w.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        Object svc = getSystemService(Context.CONSUMER_IR_SERVICE);
-        if (svc instanceof ConsumerIrManager) {
-            ir = (ConsumerIrManager) svc;
-            try { hasIr = ir.hasIrEmitter(); } catch (Throwable t) { hasIr = false; }
-        }
+        bt  = new BtLink();
         vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
 
-        txThread = new HandlerThread("ir-tx");
+        txThread = new HandlerThread("bt-tx");
         txThread.start();
         tx = new Handler(txThread.getLooper());
 
-        initCarrier();
-
         setContentView(buildUi());
-        log("红外硬件: hasIrEmitter() = " + hasIr);
-        log(carrierInfo);
-        if (ir == null) { log("✗ 系统没有 ConsumerIrManager 服务"); }
-        else if (!hasIr) { log("系统说没有发射管，仍会尝试发射，结果写在下面"); }
-        log("就绪 · " + carrierHz + " Hz · 按下 " + FRAMES_FIRST + " 帧 / 维持 "
-            + FRAMES_KEEP + " 帧 / 停车 " + FRAMES_STOP + " 帧");
-        log("v2.4 圆盘左右 = 原地转向 · 新增遛狗模式 · 帧间隔 " + FRAME_GAP_MS + "ms");
+
+        log("蓝牙: " + (bt.available() ? (bt.enabled() ? "已打开" : "未打开") : "本机不支持"));
+        log("未连接 —— 点右上角「连接」选 HC-05");
+        log("v3.0 蓝牙遥控：圆盘=原地转向，按住每 " + REPEAT_MS + "ms 发一次");
+
+        /* Android 12+ 访问已配对设备需要运行时权限，否则 getBondedDevices 直接抛异常 */
+        if (Build.VERSION.SDK_INT >= 31
+                && checkSelfPermission("android.permission.BLUETOOTH_CONNECT")
+                   != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { "android.permission.BLUETOOTH_CONNECT" }, 1001);
+        }
 
         // 后台查更新：没网/镜像挂了都只是安静跳过，不影响遥控
         startUpdateCheck();
@@ -316,7 +317,7 @@ public class MainActivity extends Activity
         title.setLetterSpacing(0.08f);
 
         TextView sub = new TextView(this);
-        sub.setText("红外遥控 · " + (carrierHz / 1000) + " kHz");
+        sub.setText("蓝牙遥控 · HC-05 SPP");
         sub.setTextColor(C_DIM);
         sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         sub.setPadding(0, dp(2), 0, 0);
@@ -329,7 +330,18 @@ public class MainActivity extends Activity
         pill.setPadding(dp(12), dp(6), dp(12), dp(6));
         pill.setTextColor(C_ACCENT);
         pill.setBackground(round(0x1A35E0A1, 0x5535E0A1, dp(20)));
-        pill.setText(hasIr ? "●  就绪" : "●  无红外");
+        /* 状态块直接当"连接"按钮用：未连接时点它弹设备列表 */
+        pill.setClickable(true);
+        pill.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (bt != null && bt.connected()) {
+                    log("已连接 " + bt.deviceLabel());
+                } else {
+                    pickBtDevice();
+                }
+            }
+        });
+        renderPill();
 
         LinearLayout.LayoutParams lpTitle = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -353,11 +365,6 @@ public class MainActivity extends Activity
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lpBanner.topMargin = dp(10);
         root.addView(banner, lpBanner);
-
-        if (!hasIr) {
-            pill.setTextColor(C_DANGER);
-            pill.setBackground(round(0x1AFF5E6C, 0x55FF5E6C, dp(20)));
-        }
 
         /* ---- 圆盘 ---- */
         FrameLayout padHolder = new FrameLayout(this);
@@ -478,7 +485,7 @@ public class MainActivity extends Activity
 
         /* ---- 底部说明 ---- */
         TextView foot = new TextView(this);
-        foot.setText("连发 " + REPEAT_MS + " ms  ·  松手立即刹车  ·  遛狗中按任意方向键即接管");
+        foot.setText("按住每 " + REPEAT_MS + " ms 发送  ·  松手立即刹车  ·  断连自动停车");
         foot.setTextColor(0xFF4F5B69);
         foot.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
         foot.setGravity(Gravity.CENTER);
@@ -526,41 +533,6 @@ public class MainActivity extends Activity
     /* ================= 发送 ================= */
 
     /** 从系统报告的载波范围里挑出 38000 能用的那个，挑不到就退到最近边界 */
-    private void initCarrier()
-    {
-        if (ir == null) { carrierInfo = "载波：无 ConsumerIrManager"; return; }
-        try {
-            ConsumerIrManager.CarrierFrequencyRange[] rs = ir.getCarrierFrequencies();
-            if (rs == null || rs.length == 0) {
-                carrierInfo = "载波范围：系统未报告，按 38000 用";
-                return;
-            }
-            StringBuilder sb = new StringBuilder("载波范围: ");
-            boolean inside = false;
-            int nearest = rs[0].getMinFrequency();
-            int bestDist = Integer.MAX_VALUE;
-            for (int i = 0; i < rs.length; i++) {
-                int lo = rs[i].getMinFrequency();
-                int hi = rs[i].getMaxFrequency();
-                if (i > 0) { sb.append(" / "); }
-                sb.append(lo).append('-').append(hi);
-                if (38000 >= lo && 38000 <= hi) { inside = true; }
-                int d1 = Math.abs(lo - 38000), d2 = Math.abs(hi - 38000);
-                if (d1 < bestDist) { bestDist = d1; nearest = lo; }
-                if (d2 < bestDist) { bestDist = d2; nearest = hi; }
-            }
-            if (!inside) {
-                carrierHz = nearest;
-                sb.append("  → 38000 不在范围内，改用 ").append(carrierHz);
-            } else {
-                carrierHz = 38000;
-            }
-            carrierInfo = sb.toString();
-        } catch (Throwable t) {
-            carrierInfo = "读载波范围失败: " + t.getClass().getSimpleName();
-        }
-    }
-
     /* ================= 遛狗模式 ================= */
 
     private void renderDogBtn()
@@ -595,7 +567,7 @@ public class MainActivity extends Activity
 
     private void toggleDog()
     {
-        if (ir == null) { log("✗ 没有红外服务，无法启动"); return; }
+        if (bt == null || !bt.connected()) { log("✗ 蓝牙未连接，先点右上角状态块连接"); return; }
 
         if (raceOn) {                       // 两种自动模式互斥
             raceOn = false;
@@ -620,7 +592,7 @@ public class MainActivity extends Activity
 
     private void toggleRace()
     {
-        if (ir == null) { log("✗ 没有红外服务，无法启动"); return; }
+        if (bt == null || !bt.connected()) { log("✗ 蓝牙未连接，先点右上角状态块连接"); return; }
 
         if (dogOn) {                        // 两种自动模式互斥
             dogOn = false;
@@ -643,8 +615,9 @@ public class MainActivity extends Activity
 
     private void press(int code, String name, boolean needsStop)
     {
-        if (ir == null) {
-            log("✗ 没有红外服务，无法发送");
+        if (bt == null || !bt.connected()) {
+            log("✗ 蓝牙未连接，点右上角状态块连接 HC-05");
+            renderPill();
             return;
         }
         if (activeCode == code && needsStop) { return; }   // 同一动作重复按下不重发
@@ -679,73 +652,147 @@ public class MainActivity extends Activity
         if (needStop) { fire(CODE_STOP, "松手即停", true, FRAMES_STOP); }
     }
 
-    /**
-     * 真正发射。异常不再被吞掉——发送失败会把原因写到日志区，
-     * 这样"按了没反应"能直接看出是硬件不支持还是被系统拒了。
-     *
-     * 排队规则跟旧版一致：先把还没轮到的旧指令全丢掉，再排最新这条。
-     * 这样连按时不会积压一串过期帧，停车帧永远排在最前。
-     */
+    /** 动作 ID → 发给车的单字符命令（与固件 runMotion 一一对应） */
+    private static String cmdOf(int code)
+    {
+        switch (code) {
+            case CODE_FWD:      return "F";
+            case CODE_BACK:     return "B";
+            case CODE_STOP:     return "S";
+            case CODE_SPINL:    return "L";
+            case CODE_SPINR:    return "R";
+            case CODE_DOG_ON:   return "G";
+            case CODE_DOG_OFF:  return "g";
+            case CODE_RACE_ON:  return "P";
+            case CODE_RACE_OFF: return "p";
+            default:            return null;
+        }
+    }
+
+    /* 下面两个是旧红外接口，保留签名让调用点不用改；
+     * 蓝牙是字节流连接，不像红外那样需要连发多帧抗丢包，各发一次即可。 */
     private void fire(final int code, final String name, final boolean record,
                       final int frames)
     {
-        fireGap(code, name, record, frames, FRAME_GAP_MS);
+        sendCmd(code, name, record);
     }
 
-    /** 帧间隔可调：自动模式的开关命令要用大间隔分散发送，才扛得住丢帧。 */
     private void fireSlow(final int code, final String name,
                           final int frames, final int gapMs)
     {
-        fireGap(code, name, true, frames, gapMs);
+        sendCmd(code, name, true);
     }
 
-    private void fireGap(final int code, final String name, final boolean record,
-                         final int frames, final int gapMs)
+    /**
+     * 真正发送。失败意味着连接断了 —— 此时什么都不做，
+     * 车端 450ms 看门狗会自己刹车，比在这里补发更可靠。
+     */
+    private void sendCmd(final int code, final String name, final boolean record)
     {
-        if (ir == null) { return; }
+        final String cmd = cmdOf(code);
+        if (cmd == null) { return; }
 
-        final int[] frame = necFrame(code);
-
+        if (bt == null || !bt.connected()) {
+            log("✗ 蓝牙未连接，发不出去（点右上角连接）");
+            renderPill();
+            return;
+        }
         if (tx == null) { log("✗ 发送线程没起来"); return; }
-        tx.removeCallbacksAndMessages(null);
 
+        tx.removeCallbacksAndMessages(null);     // 丢掉积压的旧指令，只发最新这条
         tx.post(new Runnable() {
             @Override public void run() {
-                long t0 = System.nanoTime();
-                String err = null;
-                try {
-                    for (int i = 0; i < frames; i++) {
-                        if (i > 0) { Thread.sleep(gapMs); }
-                        ir.transmit(carrierHz, frame);
-                    }
-                } catch (InterruptedException ie) {
-                    err = "被中断";
-                } catch (Throwable t) {
-                    String m = t.getMessage();
-                    err = t.getClass().getSimpleName() + (m == null ? "" : ": " + m);
-                }
-                final long ms = (System.nanoTime() - t0) / 1000000L;
-
-                if (err != null) {
-                    final String e = err;
-                    ui.post(new Runnable() { @Override public void run() {
-                        log("✗ 发射失败 " + e);
-                        if (pill != null) {
-                            pill.setText("●  发射被拒");
-                            pill.setTextColor(C_DANGER);
-                            pill.setBackground(round(0x1AFF5E6C, 0x55FF5E6C, dp(20)));
+                final boolean ok = bt.send(cmd);
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        if (!ok) {
+                            log("✗ 发送失败，连接已断开");
+                            renderPill();
+                        } else if (record) {
+                            log("→ " + name + "  [" + cmd + "]");
                         }
-                    }});
-                } else if (record) {
-                    ui.post(new Runnable() { @Override public void run() {
-                        log("→ " + name + "  " + String.format(Locale.US, "%08X", code)
-                            + "  " + frames + " 帧 " + ms + "ms");
-                    }});
-                }
+                    }
+                });
             }
         });
 
         if (record) { buzz(10); }
+    }
+
+    /* ================= 蓝牙连接 ================= */
+
+    /** 顶部状态块：颜色和文案跟着连接状态走 */
+    private void renderPill()
+    {
+        if (pill == null) { return; }
+
+        if (bt == null || !bt.available()) {
+            pill.setText("●  无蓝牙");
+            pill.setTextColor(C_DANGER);
+            pill.setBackground(round(0x1AFF5E6C, 0x55FF5E6C, dp(20)));
+        } else if (!bt.enabled()) {
+            pill.setText("●  蓝牙未开");
+            pill.setTextColor(C_DANGER);
+            pill.setBackground(round(0x1AFF5E6C, 0x55FF5E6C, dp(20)));
+        } else if (bt.connected()) {
+            pill.setText("●  已连接");
+            pill.setTextColor(C_ACCENT);
+            pill.setBackground(round(0x1A35E0A1, 0x5535E0A1, dp(20)));
+        } else {
+            pill.setText("●  未连接");
+            pill.setTextColor(C_DIM);
+            pill.setBackground(round(0x1A7C8B9B, 0x557C8B9B, dp(20)));
+        }
+    }
+
+    /** 弹已配对设备列表让用户选 */
+    private void pickBtDevice()
+    {
+        if (bt == null || !bt.available()) { log("✗ 这台设备没有经典蓝牙"); return; }
+        if (!bt.enabled()) { log("✗ 蓝牙没打开，先去系统设置里打开"); return; }
+
+        final java.util.List<android.bluetooth.BluetoothDevice> ds = bt.paired();
+        if (ds.isEmpty()) {
+            log("✗ 没有已配对设备：先去系统设置 → 蓝牙 里配对 HC-05（默认密码 1234 或 0000）");
+            return;
+        }
+
+        String[] names = new String[ds.size()];
+        for (int i = 0; i < ds.size(); i++) { names[i] = BtLink.nameOf(ds.get(i)); }
+
+        new AlertDialog.Builder(this)
+            .setTitle("选择蓝牙设备")
+            .setItems(names, new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int which) {
+                    doConnect(ds.get(which));
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /** 建连会阻塞几秒，必须丢到子线程 */
+    private void doConnect(final android.bluetooth.BluetoothDevice dev)
+    {
+        if (tx == null) { return; }
+        log("正在连接 " + BtLink.nameOf(dev) + " …");
+
+        tx.post(new Runnable() {
+            @Override public void run() {
+                final String err = bt.connect(dev);
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        if (err == null) {
+                            log("✓ 已连接 " + bt.deviceLabel());
+                            buzz(30);
+                        } else {
+                            log("✗ 连接失败 " + err);
+                        }
+                        renderPill();
+                    }
+                });
+            }
+        });
     }
 
     /**
@@ -759,23 +806,6 @@ public class MainActivity extends Activity
      * 按 bit0 → bit31 发，车端会解成 0xB946FF00，KEY_TABLE 一条都对不上，
      * 表现就是「App 日志显示发送成功、车一动不动」。
      */
-    private static int[] necFrame(int code)
-    {
-        int[] p = new int[67];
-        int k = 0;
-        p[k++] = 9000;                       // 引导 mark
-        p[k++] = 4500;                       // 引导 space
-
-        int space = 560;
-        for (int bit = 31; bit >= 0; bit--) {
-            p[k++] = 560;                    // 位 mark 固定 560
-            space  = ((code >>> bit) & 1) != 0 ? 1690 : 560;
-            p[k++] = space;                  // 位 space：1→1690，0→560
-        }
-        p[66] = space;                       // 末位补一个空格（旧版同款，67 个）
-        return p;
-    }
-
     private void buzz(int ms)
     {
         if (vib == null || !vib.hasVibrator()) { return; }

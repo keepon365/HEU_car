@@ -1,7 +1,7 @@
 {
-  "versionCode": 10,
-  "versionName": "2.8",
-  "note": "修复 v2.7 装上后闪退：javac 编译失败被构建脚本吞掉，打出了缺 Updater.class 的 dex。构建现在会硬中断，并校验每个源文件都编译出 class",
-  "size": 45857,
-  "md5": "4e69e03cb690e366203b96ef86eb5b2a"
+  "versionCode": 11,
+  "versionName": "3.0",
+  "note": "改用蓝牙遥控：删除红外发射，新增 HC-05 连接（经典蓝牙 SPP）。界面顶部状态块点击即可连接；按住每 80ms 发送一次，断连自动停车。",
+  "size": 49953,
+  "md5": "0a683d2216c061e4dc4a91e414ce0bf8"
 }

@@ -186,7 +186,6 @@
  *      pwsh -File .\tools\build.ps1 -SketchDir .\05_dir_speed\DirSpeedTest
  * ==========================================================================*/
 
-#include <IRremote.h>
 #include <EEPROM.h>       // 存左右增益，改完不用重烧
 #include <Servo.h>        // 遛狗模式：舵机扫描（占用 Timer1，与电机 PWM 的 Timer0 不冲突）
 
@@ -517,6 +516,8 @@
 /* ---------------------------------------------------------------------------
  *  【引脚】
  * -------------------------------------------------------------------------*/
+/* 红外接收脚 A4 —— 已停用。改用蓝牙（HC-05，接 P7 座 → D0/D1 硬件串口）。
+ * 保留这个定义只是为了让下面提到它的注释还能读懂，实际不再使用。 */
 const uint8_t RECV_PIN = A4;
 
 /* 超声波 HC-SR04：直连 UNO（扩展板的 CSB1 插座 5V 不供电，实测走插座不通）。
@@ -550,8 +551,9 @@ const uint8_t SERVO_N      = sizeof(SERVO_PINS) / sizeof(SERVO_PINS[0]);
  *  蜂鸣器（A3）—— 软件方波，**绝对不能用 tone()**
  * ---------------------------------------------------------------------------
  *  ★ 为什么不能用 tone()：
- *      AVR 上 IRremote 用的是 Timer2（TIMER2_COMPA_vect，见 IRremoteInt.h 的
- *      IR_USE_TIMER2），而 tone() 同样占 Timer2 —— 一响，红外接收立刻失效，
+ *      原本：AVR 上 IRremote 占 Timer2，而 tone() 也用 Timer2，一响红外就废。
+ *      现在红外已拆、Timer2 空出来了，理论上可以改用 tone()；但软件方波已经
+ *      跑通且不受库影响，没必要为了省几行去重测音质。
  *      车就不再听遥控了。所以这里用 micros() 自己翻转引脚，不碰任何定时器。
  *      Servo 库占 Timer1，电机 PWM 占 Timer0，互不影响。
  *
@@ -969,49 +971,11 @@ const int8_t DIR_BACKWARD = -1;
  * ---------------------------------------------------------------------------
  *  duty = 0 表示"停车"，走刹车流程（四个 IN 全低 + 使能给满）。
  * -------------------------------------------------------------------------*/
-struct KeyAction
-{
-  uint32_t code;
-  const char *name;
-  int8_t leftWheel;
-  int8_t rightWheel;
-  uint8_t duty;
-};
 
-const KeyAction KEY_TABLE[] =
-{
-  // 键码            名字          左轮          右轮          巡航占空比
-  { 0x00FF629DUL, "CH   前进",  DIR_FORWARD,  DIR_FORWARD,  DUTY_BASE },
-  { 0x00FFA857UL, "+    后退",  DIR_BACKWARD, DIR_BACKWARD, DUTY_BACK },
-  { 0x00FF22DDUL, "<<   左转",  DIR_STOP,     DIR_FORWARD,  DUTY_TURN },
-  { 0x00FFC23DUL, ">||  右转",  DIR_FORWARD,  DIR_STOP,     DUTY_TURN },
-  { 0x00FF02FDUL, ">>|  停车",  DIR_STOP,     DIR_STOP,     0         },
-  // 这两个键承担整车的转向功能（App 圆盘左右即映射到这里）。
-  // 方向按实车实测反相过一次：上一版按"左"实际往右偏，故左右轮对调。
-  // 若将来换电机接线，这里要再翻一次 —— 只改这两行，其余不用动。
-  { 0x00FFE01FUL, "-    左转",  DIR_FORWARD,  DIR_BACKWARD, DUTY_SPIN },
-  { 0x00FF906FUL, "EQ   右转",  DIR_BACKWARD, DIR_FORWARD,  DUTY_SPIN },
-};
-const uint8_t KEY_COUNT = sizeof(KEY_TABLE) / sizeof(KEY_TABLE[0]);
-
-/* ---- 自动模式的触发键：开、关各一个码，**都幂等** ----
- * ★ 为什么不是"按一下切换"（2026-11-17 用户实测踩到）：
- *   红外是单向、无确认的。车一旦跑开、角度偏了，那一帧结束命令丢了，
- *   车就再也停不下来；而 App 为了提高命中率多补两帧，反而会把它来回切。
- *   所以改成「开」「关」两个不同码：同一条命令发一百遍，结果都一样。
- *      遛狗  开 = 数字键 0 (0x00FF6897)   关 = 数字键 1 (0x00FF30CF)
- *      比赛  开 = 数字键 2 (0x00FF18E7)   关 = 数字键 3 (0x00FF7A85)
- * 四个都不进 KEY_TABLE，语义和"按住才走"不同。 */
-const uint32_t CODE_DOG_ON   = 0x00FF6897UL;
-const uint32_t CODE_DOG_OFF  = 0x00FF30CFUL;
-const uint32_t CODE_RACE_ON  = 0x00FF18E7UL;
-const uint32_t CODE_RACE_OFF = 0x00FF7A85UL;
 
 /* ---------------------------------------------------------------------------
  *  【全局状态】
  * -------------------------------------------------------------------------*/
-IRrecv irrecv(RECV_PIN);
-decode_results results;
 
 int8_t   wheelLeft   = DIR_STOP;
 int8_t   wheelRight  = DIR_STOP;
@@ -1027,7 +991,8 @@ uint32_t lastCommandMs = 0;
 uint32_t lastCodeMs    = 0;
 uint32_t lastCode      = 0;
 bool     lastCodeMapped = false;   // 上一帧是否是本程序认得的动作键（防抖分支用它续命）
-uint16_t frameGapAvg = 200;        // 平滑后的"帧到达间隔"，自适应阈值基于它
+uint16_t frameGapAvg = 80;         // 平滑后的命令到达间隔；蓝牙 App 每 80ms 发一次，
+                                   // 红外时代是 200ms。自适应阈值基于它，下限 450ms 兜底
 uint16_t deadmanMs   = DEADMAN_MIN_MS;   // 当前生效的抬手即停阈值（随实测帧间隔自动更新）
 
 #if DOG_ENABLED
@@ -1081,6 +1046,7 @@ uint8_t scaleSpeed(uint8_t duty)
 extern bool dogOn;
 extern uint8_t dogMode;
 extern uint16_t turnDps;                                 // 运行时旋转角速度（度/秒）
+bool runMotion(char c);                                  // 运动命令（蓝牙单字符）
 extern uint16_t aimDps;                                  // 微调角速度（Q 标定用）
 extern uint8_t  aimDuty;                                 // 微调占空比（A 可在线改）
 extern uint8_t  beaconPhase;                             // Q 标定借用它绕开加速曲线
@@ -1147,6 +1113,12 @@ void saveCal()
 void handleSerialCmd()
 {
   cmdBuf[cmdLen] = '\0';
+
+  /* ---- 先试运动命令（单字符）----
+   * 蓝牙 App 发的就是 F/B/L/R/S/G/P 单个字母。
+   * 只拦长度 1：L250 / S1050 / B1 / Q390 这些调试命令照旧往下走。 */
+  if (cmdLen == 1 && runMotion(cmdBuf[0])) { return; }
+
   char k = cmdBuf[0];
   if (k >= 'a' && k <= 'z') { k = (char)(k - 32); }   // 小写也认
 
@@ -1502,7 +1474,7 @@ void     serviceRamp();
 void     pulseLed();
 void     serviceLed();
 void     serviceAutoStop();
-void     handleFrame();
+bool     runMotion(char c);
 
 /* 遛狗模式（实现见 handleFrame 之前那一整段） */
 void     dogServoWrite(uint8_t deg);
@@ -1575,7 +1547,8 @@ void setup()
   Serial.print(DEADMAN_FIXED_MS);
   Serial.println(F("ms（固定阈值）"));
 #endif
-  Serial.println(F(" 按 CH=前进  +=后退  >>|=停车"));
+  Serial.println(F(" 蓝牙命令：F前进 B后退 L左旋 R右旋 S停"));
+  Serial.println(F("            G遛狗开 g关   P比赛开 p关   多字符=调试参数"));
 #if DOG_ENABLED
   Serial.println(F("   自动模式：遛狗=数字0 比赛=数字2（关=1/3）  串口 G/P"));
   Serial.println(F("   蜂鸣器 A3：启动两声上行 / 结束一声低 / 收集完成三声"));
@@ -1620,7 +1593,8 @@ void setup()
   pinMode(PIN_KEY, INPUT_PULLUP);
 
   brakeCar();          // 上电先确保电机停着
-  irrecv.enableIRIn(); // 红外接收开始（占用 Timer2，与 Timer0 的 PWM 互不影响）
+  /* 红外已拆除（改用蓝牙，接 D0/D1 = Serial）。
+   * Timer2 因此空出来了，但蜂鸣器仍用软件方波，不必改。 */
 }
 
 /* ---------------------------------------------------------------------------
@@ -2926,126 +2900,94 @@ void serviceDog()
 /* ---------------------------------------------------------------------------
  *  处理一帧已解码的红外数据
  * -------------------------------------------------------------------------*/
-void handleFrame()
+/* ===========================================================================
+ *  运动命令（蓝牙 App 发的就是单个字母）
+ * ---------------------------------------------------------------------------
+ *      F 前进    B 后退    L 左旋    R 右旋    S 停止
+ *      G 遛狗开/关    P 比赛开/关
+ *
+ *  ★ 只认这 7 个字母；其余单字符（W 存盘 / D 恢复 / V 翻转 / M 音乐 /
+ *    N 引脚 / Q 标定）仍然走下面 handleSerialCmd 的调试分支，不会被吃掉。
+ *  ★ 抬手即停靠 lastCommandMs：App 按住时每 80ms 发一次，一旦断连
+ *    或松手不再发，看门狗 450ms 后自动刹车。
+ * =========================================================================*/
+bool runMotion(char c)
 {
-  const uint32_t code = (uint32_t)results.value;
-  const uint32_t t    = nowMs();
-
-  // A. NEC 重发帧（按住不放时遥控器发这个）
-  if (code == 0xFFFFFFFFUL || results.bits == 0)
-  {
-    lastCommandMs = t;      // 重发帧同样算"还按着"
-    return;
-  }
-
-  // B. 解不出协议（噪声 / 陌生遥控器）
-  if (results.decode_type == UNKNOWN)
-  {
-#if DEBUG_SERIAL
-    Serial.print(F("[未知] code=0x"));
-    Serial.print(code, HEX);
-    Serial.print(F("  rawlen="));
-    Serial.println(results.rawlen);
-#endif
-#if STOP_ON_UNKNOWN
-    brakeCar();
-#endif
-    return;
-  }
-
-  // C. 防抖
-  if (code == lastCode && (t - lastCodeMs) < DEBOUNCE_MS)
-  {
-    lastCodeMs = t;
-    // 同一动作键的紧凑重发（App 一帧里塞几组）也算"还按着"，
-    // 否则看门狗会把按住误判成松手，车会一顿一顿地停。
-    if (lastCodeMapped) { lastCommandMs = t; }
-    return;
-  }
-  lastCode   = code;
-  lastCodeMs = t;
-
 #if DOG_ENABLED
-  /* ---- 自动模式：开、关各一个码，两条命令都是幂等的 ----
-   * 红外没有回执，只能靠"重复发同一条命令不会产生副作用"来保证可靠。
-   * 不用"按一下切换"的原因见 CODE_DOG_ON 上面的说明。 */
-  if (code == CODE_DOG_ON || code == CODE_DOG_OFF ||
-      code == CODE_RACE_ON || code == CODE_RACE_OFF)
+  /* 任何运动命令都先接管：掐掉提示音、退出自动模式 */
+  const bool isAuto = (c == 'G' || c == 'P' || c == 'g' || c == 'p');
+  if (!isAuto)
   {
-    pulseLed();
-    lastCodeMapped = true;
-
-    if (code == CODE_DOG_OFF || code == CODE_RACE_OFF)
-    {
-      if (dogOn) { dogStop("收到关闭命令"); }
-      else       { Serial.println(F("[DOG] 已经是停止状态")); }
-    }
-    else
-    {
-      const uint8_t want = (code == CODE_RACE_ON) ? MODE_RACE : MODE_DOG;
-      if (dogOn && dogMode == want) { /* 重复帧，什么都不做 */ }
-      else
-      {
-        if (dogOn) { dogStop("切换模式", false); }   // 切模式不转圈
-        dogStart(want);
-      }
-    }
-    return;
-  }
-#endif
-
-  // D. 查表
-  for (uint8_t i = 0; i < KEY_COUNT; i++)
-  {
-    if (KEY_TABLE[i].code != code) { continue; }
-
-#if DOG_ENABLED
-    // 任何动作键都立刻接管：先掐掉提示旋转，再退出遛狗，最后照常执行这个动作
     beaconCancel();
-    if (dogOn) { dogStop("手动接管", false); }   // 接管时不转圈，免得和按键抢电机
+    musicOn = false;
+    if (dogOn) { dogStop("手动接管", false); }
+  }
 #endif
 
-    pulseLed();
-#if DEBUG_SERIAL
-    Serial.print(F("[动作] "));
-    Serial.print(KEY_TABLE[i].name);
-    Serial.print(F("   L="));
-    Serial.print(KEY_TABLE[i].leftWheel);
-    Serial.print(F(" R="));
-    Serial.print(KEY_TABLE[i].rightWheel);
-    Serial.print(F("   duty="));
-    Serial.println(KEY_TABLE[i].duty);
-#endif
-    lastCodeMapped = true;
+  int8_t  lw   = DIR_STOP;
+  int8_t  rw   = DIR_STOP;
+  uint8_t duty = 0;
 
-    // 按住期间的帧间隔 → 自动定阈值。moving 是"这一帧之前"在不在走。
-    const uint32_t gap = t - lastCommandMs;
-    if (moving) { noteFrameGap(gap); }
-  #if DEBUG_SERIAL
-    if (moving && gap < 2000)
-    {
-      Serial.print(F("[帧] 间隔=")); Serial.print(gap);
-      Serial.print(F("ms  阈值="));  Serial.print(deadmanMs);
-      Serial.println(F("ms"));
-    }
+  switch (c)
+  {
+    case 'F': lw = DIR_FORWARD;  rw = DIR_FORWARD;  duty = DUTY_BASE; break;
+    case 'B': lw = DIR_BACKWARD; rw = DIR_BACKWARD; duty = DUTY_BACK; break;
+    /* 左右旋：一轮前进一轮后退，和原来遥控器圆盘一致 */
+    case 'L': lw = DIR_FORWARD;  rw = DIR_BACKWARD; duty = DUTY_SPIN; break;
+    case 'R': lw = DIR_BACKWARD; rw = DIR_FORWARD;  duty = DUTY_SPIN; break;
+
+    case 'S':
+      brakeCar();
+      pulseLed();
+    #if DEBUG_SERIAL
+      Serial.println(F("[动作] 停止"));
+    #endif
+      return true;
+
+  #if DOG_ENABLED
+    /* ★ 开、关分开成大小写两个字符，**各自幂等**：
+     *   同一个命令发一百遍结果都一样，丢一帧不会把状态翻过来。
+     *   （红外时代是拆成两个不同键码，现在用大小写，省协议位）
+     *   runMotion 拿到的是原始字符，不受后面"小写转大写"影响。 */
+    case 'G':
+      if (dogOn && dogMode == MODE_DOG) { /* 已经是遛狗，忽略 */ }
+      else { if (dogOn) { dogStop("切换模式", false); } dogStart(MODE_DOG); }
+      pulseLed();
+      return true;
+
+    case 'g':
+      if (dogOn) { dogStop("收到关闭命令"); } else { Serial.println(F("[DOG] 已经是停止状态")); }
+      pulseLed();
+      return true;
+
+    case 'P':
+      if (dogOn && dogMode == MODE_RACE) { /* 已经是比赛，忽略 */ }
+      else { if (dogOn) { dogStop("切换模式", false); } dogStart(MODE_RACE); }
+      pulseLed();
+      return true;
+
+    case 'p':
+      if (dogOn) { dogStop("收到关闭命令"); } else { Serial.println(F("[DOG] 已经是停止状态")); }
+      pulseLed();
+      return true;
   #endif
 
-    // 单边转弯（恰好一只轮子为 STOP）用运行时可调的 turnDuty；其余用表里的值
-    const int8_t  lw = KEY_TABLE[i].leftWheel;
-    const int8_t  rw = KEY_TABLE[i].rightWheel;
-    const bool  isTurn = ((lw == DIR_STOP) != (rw == DIR_STOP));
-    setWheels(lw, rw, isTurn ? turnDuty : KEY_TABLE[i].duty);
-    return;
+    default:
+      return false;          // 不是运动命令，交给调试解析
   }
 
-  // E. 键码合法但表里没有（本程序没有速度档，所以数字键会走到这里）
-#if DEBUG_SERIAL
-  Serial.print(F("[未映射] 0x"));
-  Serial.print(code, HEX);
-  Serial.println(F("  （本测试程序只有七个动作键）"));
-#endif
-  lastCodeMapped = false;
   pulseLed();
+  lastCommandMs = nowMs();
+  setWheels(lw, rw, duty);
+
+#if DEBUG_SERIAL
+  Serial.print(F("[动作] "));
+  Serial.print(c);
+  Serial.print(F("  L="));   Serial.print(lw);
+  Serial.print(F(" R="));     Serial.print(rw);
+  Serial.print(F("  duty=")); Serial.println(duty);
+#endif
+  return true;
 }
 
 /* ---------------------------------------------------------------------------
@@ -3053,13 +2995,9 @@ void handleFrame()
  * -------------------------------------------------------------------------*/
 void loop()
 {
-  serviceSerial();        // 串口调参：L250 / R248 / W 存盘 / D 恢复默认
-
-  if (irrecv.decode(&results))
-  {
-    handleFrame();
-    irrecv.resume();      // 漏了这句就只响应第一次按键
-  }
+  /* 蓝牙（接 D0/D1，与 USB 同一路串口）和 USB 共用这里：
+   * 单字符 = 运动命令，多字符 = 调试参数。 */
+  serviceSerial();
 
   /* 蜂鸣器每拍都要服务：它是软件方波，靠主循环翻转电平。
    * 放在最前面，保证提示音不被后面的逻辑拖慢。

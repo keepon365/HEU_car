@@ -1,142 +1,205 @@
-# ZYAR20A 智能小车 · 红外遥控实验（重制版）
+# HEU_car 项目结构导览
 
-把光盘 `3.ZYAR20A程序\9、智能小车红外遥控实验\Remote_contorl` 里那份 2017 年的
-Arduino 程序整理成了：**能编译、能看懂、能改** 的几份代码 + 七篇中文文档。
+## 这是什么
 
-原版程序 213 行，没有一句"为什么"。这个仓库就是来补上那个"为什么"的。
+一台蓝牙遥控小车，加了两套自动模式（**遛狗**：追会动的东西；**比赛**：一路推向最近的物块）。
+
+- **车端**：Arduino UNO 裸机固件，单文件 3045 行，全部逻辑在里面
+- **手机端**：自己写的蓝牙遥控 App（Java，不用 Gradle），带 GitHub 自更新
+- **硬件**：ZYAR20A 亚克力底盘 + L298N + UNO + 扩展板 + 超声波 + 三颗舵机 + 蜂鸣器
 
 ---
 
-## 30 秒上手
+## 一、根目录
 
-```powershell
-# 1. 编译（不需要装 Arduino IDE，用你机器上 IDE 自带的 avr-gcc）
-cd D:\DSH\PicScan\Arduino1
-pwsh -File .\tools\build.ps1 -SketchDir .\02_annotated\RemoteControl_Annotated
+| 文件 / 目录 | 大小 | 作用 | 备注 |
+|---|---|---|---|
+| **`DirSpeedTest/DirSpeedTest.ino`** | 135 KB / **3045 行** | **主固件，一切控制逻辑** | 见第二节 |
+| `app/` | — | 安卓 App 源码 + 打包脚本 | 见第三节 |
+| `test/` | — | 8 个硬件测试固件 | 见第四节 |
+| `dist/` | 46 KB | 发布产物：`app.apk` + `version.json` | 手机更新读的就是这里 |
+| **`遛狗模式.md`** | 16 KB | **两套自动模式的完整逻辑说明**（最新） | 强烈建议先看 |
+| `README.md` | 8.7 KB | 项目说明（偏早期） | 可看，部分过时 |
+| `90_交接文档.md` | 14 KB | 更早的交接材料 | 只作参考 |
+| `红外遥控车.apk` | 827 KB | **厂商原始 APK** | 反编译参考用，别删 |
+| `红外遥控车.apk.1` | 827 KB | 同上，**md5 完全相同的副本** | 可以删 |
+| `ZYAR20A遥控.apk` | 46 KB | 自己打的包（`dist/app.apk` 的副本） | 传手机用 |
+| `SensorTest.ino` | 11.5 KB | 循迹 / 避障 / 舵机自检 | 散落在根目录，Arduino 打不开（缺同名目录） |
+| `烧录.bat` | 6.9 KB | 改参数 → 编译 → 烧录 → 清 EEPROM | 最常用 |
+| `发布.bat` | 3 KB | 打包 → commit → push | 发版用 |
+| `看距离.bat` / `调舵机.bat` / `看扫描.bat` | <1 KB | 双击打开串口小窗口 | 调试辅助 |
+| `扫描窗口.ps1` | 3.5 KB | `看扫描.bat` 的实际实现（按键直发串口） | 必须 UTF-8 BOM |
+| `qr-install.png` | 8 KB | 安装二维码 | |
+| `.workbuddy/memory/` | — | 项目日志（每天的踩坑记录） | 排查历史问题时查 |
 
-# 2. 生成的可烧录固件在
-#    build\RemoteControl_Annotated\RemoteControl_Annotated.hex
+---
+
+## 二、主固件 `DirSpeedTest/DirSpeedTest.ino`
+
+### 先说目录结构
+
+Arduino 要求 `.ino` 文件放在**同名目录**里，所以是 `DirSpeedTest/DirSpeedTest.ino`。
+
+编译/烧录时路径要指向这个目录：
+
+```bash
+arduino-cli compile --fqbn arduino:avr:uno DirSpeedTest/
 ```
 
-想用 Arduino IDE：把 `libraries\IRremote` 复制到 `我的文档\Arduino\libraries\`，
-打开对应文件夹里的 `.ino`，板型选 **Arduino Uno**，点上传。
-详细步骤和坑见 [`docs\00_先读我.md`](docs/00_先读我.md)。
+### 文件是按"功能块"组织的，不是按调用顺序
 
----
+Arduino 会自动生成函数原型，所以作者可以把任意函数放在任意位置。找东西靠**功能**，不靠行号顺序。
 
-## 几个程序，选一个用
+### 分区地图
 
-| 目录 | 是什么 | 什么时候用 |
+| 行号 | 内容 | 什么时候看 |
 |---|---|---|
-| `01_original\Remote_contorl\` | **原版，一字未改** | 想对照"改了什么"，或者就想要当年原样的效果 |
-| `02_annotated\RemoteControl_Annotated\` | **详解注释版**，行为与原版完全一致 | 学习。每一行都有注释，坑都写在代码里 |
-| `03_optimized\RemoteControl_Optimized\` | **我的优化版**，结构重写 + 新增可选功能 | 想继续开发，或者想学"同一件事还能怎么写" |
-| `04_button_test\ButtonMotorTest\` | **按键+电机测试**：按住板上的 S1（接 A2）前进，松开就停 | 红外还没通时，先单独验证按钮和电机 |
-| `04_pwm\RemoteControl_PWM\` | **带占空比调速**：遥控器 CH+/CH- 或数字键 1~9 调速度 | 想让车慢下来 / 想调占空比，见 `docs\06` |
-| `05_dir_speed\DirSpeedTest\` | **测试程序**：基准速度 120、倒车 96，带起步防打滑曲线 + 死区补偿(TRIM) + 增益补偿(GAIN)，内置 SWAP_EN 处理 EN 交叉 | 验证 PWM、调起步同步与巡航直线 |
-| `06_side_calib\SideCalib\` | **标定工具**（v2 分段变速，细区每格 400ms）：分别慢慢加左右轮的占空比 | 左右轮起步不同步时先跑它，读阈值填 TRIM |
-| `07_side_diag\SideDiag\` | **判别工具**：四段循环，串口写明"现在应该谁动"，用来确认哪根线管哪个轮子 | 补偿加到很大也没效果时跑它（多半是 EN 接反） |
+| 1 – 270 | **文件头说明 + 全部可调参数** | 改参数先看这里 |
+| 271 – 548 | 两套自动模式的设计说明 + 比赛参数 | 理解意图 |
+| 549 – 628 | 蜂鸣器（为什么不能用 `tone()`） | 改声音时看 |
+| 629 – 830 | 《植物大战僵尸》曲谱 + S1 按键 | 改音乐时看 |
+| 831 – 1010 | 两颗 360° 舵机、电机常量 | |
+| 1010 – 1100 | 电机状态变量、校准值 | |
+| 1100 – 1400 | 校准存取 + **串口命令解析** | 加新命令 |
+| 1400 – 1670 | 扫描表、前进/测距 | |
+| 1678 – 2050 | 占空比合成、输出、加速曲线、抬手即停 | 调电机手感 |
+| 2073 – 2330 | 云台、选目标、**比赛决策** | 改自动模式行为 |
+| 2348 – 2600 | 转向、前进、**自动模式状态机** | 同上 |
+| 2928 – 3050 | 红外帧处理、按键表 | 加按键 |
+| 3053 – 3106 | `loop()` | 主循环 |
 
-都实测编译通过（avr-gcc 7.3.0 + Arduino AVR core 1.8.8，目标 ATmega328P @16MHz）：
+### 关键函数（行号 = 定义位置）
 
-| 程序 | Flash | SRAM |
+| 函数 | 行 | 作用 |
 |---|---|---|
-| `01_original` | 7874 B / 24.0% | 449 B / 21.9% |
-| `02_annotated` | 7618 B / 23.2% | 410 B / 20.0% |
-| `03_optimized` | **6836 B / 20.9%** | **388 B / 18.9%** |
-| `03_optimized`（调试全开） | 9288 B / 28.3% | 567 B / 27.7% |
-| `04_pwm` | 8036 B / 24.5% | 468 B / 22.9% |
-| `05_dir_speed\DirSpeedTest`（串口开） | 10726 B / 32.7% | 585 B / 28.6% |
-| `06_side_calib\SideCalib` | 4780 B / 14.6% | 206 B / 10.1% |
-| `07_side_diag\SideDiag` | 4384 B / 13.4% | 188 B / 9.2% |
+| `setup()` | 1498 | 引脚初始化、读 EEPROM、开红外 |
+| `loop()` | 2996 | 主循环：串口 → 红外 → 蜂鸣 → 状态机 → 输出 |
+| `handleSerialCmd()` | 1113 | 串口命令分发（L/R/S/T/W/D/V/X/Z/C/Q/A/M/N/B/G/P） |
+| `setWheels()` | 1753 | 设定左右轮方向 + 占空比（入口） |
+| `buildDuty()` | 1652 | 把"指令值"变成"实际 PWM"（含 TRIM/GAIN 补偿） |
+| `applyOutput()` | 1722 | 真正写 PWM 和方向脚 |
+| `brakeCar()` | 1797 | 刹车（四脚全低 + 使能拉满） |
+| `serviceRamp()` | 1880 | 加速曲线推进（每拍把 currentDuty 往 targetDuty 爬） |
+| `serviceAutoStop()` | 2000 | 抬手即停看门狗 |
+| `dogPick()` | 2086 | 从扫描结果里挑目标 |
+| `raceDecide()` | 2187 | **比赛模式决策**（搜索/对准/收集判定） |
+| `serviceDog()` | 2572 | **自动模式状态机主循环**（按 dogPhase 分派） |
+| `dogServoWrite()` | 2047 | 云台舵机（D12） |
+| `dogMeasure()` | 2055 | 超声波测一次（A0 Trig / A1 Echo） |
+| `dogTurnEx()` | 2322 | 原地旋转（可指定占空比，微调用低速） |
+| `dogGo()` | 2356 | 前进一段 |
+| `dogStart()` / `dogStop()` | 2454 / 2543 | 自动模式启停 |
+| `runMotion()` | 2914 | 红外一帧的解码与分发 |
 
-> 优化版比原版**小了约 1KB** —— 因为把七段几乎相同的电机控制代码合并成了一个函数。
->
-> `04_pwm` 和 `DirSpeedTest` 都带**起步防打滑曲线**（起步占空比 → 保持 → 按斜率爬），
-> 曲线可以用 `node tools\ramp_sim.js` 在 PC 上跑一遍验证。
+### 引脚分配（改硬件时对照）
 
----
-
-## 手机遥控（`04_phone_remote`）
-
-手机要是自带红外发射管（`ConsumerIrManager.hasIrEmitter()` 返回 true），原装遥控器就可以收起来了：
-`04_phone_remote` 是一个 Android 工程（Kotlin，**零第三方依赖**），界面 5 个键
-（前进 / 后退 / 左转 / 右转 / 停车），发出去的就是本仓库里那七个 NEC 键码，
-**车端一行都不用改**。
-
-手机端的编码器已经和车端的 `decodeNEC()` 做过端到端仿真：
-
-```powershell
-node 04_phone_remote\tools\nec_check.js
-```
-
-7 个键在 ±15% 时序抖动下 14000/14000 全部解对；故意漏发结尾 MARK 的负向测试也如实失败。
-安装与排错见 [`04_phone_remote\README.md`](04_phone_remote/README.md)；
-交接说明（已验证 / 未验证 / 踩过的坑）见 [`04_phone_remote\HANDOFF.md`](04_phone_remote/HANDOFF.md)。
-
----
-
-## 优化版改了什么
-
-1. **七段重复代码 → 一个 `setWheels(左轮, 右轮)`**：方向用 `+1 / 0 / -1` 表达，
-   "左右电机镜像安装"这件事只在一个参数里出现一次，再也不会因为抄错一个电平让车倒着跑。
-2. **一串 `if` → 常量按键表 `KEY_TABLE[]`**：加按键 = 加一行，表里顺便存了按键名字。
-3. **正确处理 NEC 重发帧 `0xFFFFFFFF`**：原版当它不存在，优化版用它实现"松手自动停"。
-4. **LED 改成 30ms 非阻塞脉冲**：原版是"翻转"，亮灭状态随机。
-5. **新增 `AUTO_STOP_MS`**：设成 500 就是"按住走、松手停"，默认 0 = 保持原版锁存行为。
-6. **`STOP_ON_UNKNOWN` 变成显式开关**：原版"噪声误停"的行为被摊开说明，不再神秘。
-7. **串口调试变成工具**：`DEBUG_SERIAL=1` 后按任意键打印键码，遇到陌生键直接告诉你"抄这行进表"。
-8. **上电先刹车**：避免上电瞬间引脚高阻导致轮子抖一下。
-
-**关于调速**：原来以为做不到（那时没看原理图）。核对原理图 + 光盘里所有工程对引脚的使用之后定下来了：
-**ENA→D5、ENB→D6**（D5 上那颗灯拔掉、两个红外避障模块拔掉，D5/D6 本来就是它们的信号脚 ZC/ZRC），
-方向脚 D8~D11 一根不动，两路 PWM 同属 Timer0、同频 977Hz，红外库一个字不用改。
-注意 **D3/D4 不能碰**——它们是循迹模块的网络（板子上"两个 D4"就是同一个网络引出两个座子），
-插着循迹模块时正被驱动。代码 `#define PIN_PLAN_A` 默认就是这套接线。
-唯一必做的前提：**拔掉 L298N 模块上 ENA/ENB 的跳线帽**。
-细节与动手顺序见 [`docs\06_加装PWM调速.md`](docs/06_加装PWM调速.md)。
+| 引脚 | 用途 |
+|---|---|
+| D2 / D7 | 左 / 右 360° 连续旋转舵机 |
+| D12 | 云台 180° 舵机（装超声波） |
+| D5 / D6 | 电机 PWM（ENA/ENB） |
+| D8 – D11 | 电机方向 |
+| D3 / D4 | 循迹（未启用） |
+| A0 / A1 | 超声波 Trig / Echo |
+| **A2** | **S1 按键**（内部上拉，按下为低） |
+| A3 | 蜂鸣器（软件方波） |
+| A4 | 空出来了（原红外接收，已拆除） |
 
 ---
 
-## 文档
+## 三、`app/` —— 安卓端
 
-| 文件 | 内容 | 建议什么时候看 |
+| 文件 | 行数 | 作用 |
 |---|---|---|
-| [`docs\00_先读我.md`](docs/00_先读我.md) | 目录说明、编译烧录步骤、上电前检查 | **先看这篇** |
-| [`docs\01_Arduino入门_写给会STM32的你.md`](docs/01_Arduino入门_写给会STM32的你.md) | STM32 ↔ Arduino 概念对照、AVR 资源、定时器分配、库机制 | 进入代码之前 |
-| [`docs\02_代码逐段讲解.md`](docs/02_代码逐段讲解.md) | 213 行逐段拆解 + 原版的 6 个问题 + 优化版的做法 | 看代码时对照 |
-| [`docs\03_硬件与接线.md`](docs/03_硬件与接线.md) | 引脚表、L298N 真值表、红外接收头、为什么不能调速 | 接线 / 想改硬件 |
-| [`docs\04_NEC红外协议.md`](docs/04_NEC红外协议.md) | 38kHz 调制、帧结构、位序（含手算示例）、重发帧 | 想吃透按键码 |
-| [`docs\05_常见问题.md`](docs/05_常见问题.md) | 编译报错、上传失败、19 种现象排查、新旧库差异 | 出问题时 |
-| [`docs\06_加装PWM调速.md`](docs/06_加装PWM调速.md) | ENA/ENB 接线、起步防打滑曲线、死区/增益补偿、EN 交叉 | 想调速时 |
-| [`docs\90_交接文档.md`](docs/90_交接文档.md) | **状态快照 + 待办 + 不要做的事 + 常用命令** | 接手项目 / 隔一段时间回来 |
+| `src/.../MainActivity.java` | 1061 | 界面 + 圆盘 + 按钮 + 蓝牙发送 |
+| `src/.../BtLink.java` | 132 | 经典蓝牙 SPP 连接（配 HC-05） |
+| `src/.../Updater.java` | 318 | 自更新：多镜像下载、版本校验、安装 |
+| `src/.../UpdateConfig.java` | 69 | 更新源地址、文件名常量 |
+| `src/.../ApkProvider.java` | 82 | `content://` 提供者（Android 13+ 装 APK 必须） |
+| `build_apk.sh` | 182 | aapt2 → javac → d8 → zipalign → apksigner |
+| `zyar.keystore` | — | 签名密钥（密码 `zyar1234`，别名 `zyar`） |
+| `AndroidManifest.xml` | — | 清单（版本号由构建脚本注入，**不要写死**） |
+| `res/mipmap-*/` | — | 图标 |
 
----
+打包：
 
-## 目录结构
-
-```
-Arduino1\
-├─ README.md                      ← 你在这里
-├─ docs\                          ← 7 篇中文讲解
-├─ reference\                     ← 原厂资料（按键表、注意事项、扩展板原理图）
-├─ libraries\IRremote\            ← 编译必需的库（Ken Shirriff v2 系）
-├─ 01_original\Remote_contorl\Remote_contorl.ino
-├─ 02_annotated\RemoteControl_Annotated\RemoteControl_Annotated.ino
-├─ 03_optimized\RemoteControl_Optimized\RemoteControl_Optimized.ino
-├─ 04_button_test\ButtonMotorTest\ButtonMotorTest.ino
-├─ 04_pwm\RemoteControl_PWM\RemoteControl_PWM.ino   ← ENA→D5 / ENB→D6 调速
-├─ 04_phone_remote\               ← 手机 App（自带红外的手机，车端零改动）
-├─ tools\build.ps1                ← 命令行编译脚本（.ino → .hex）
-└─ build\                         ← 编译产物（每个工程一个子目录）
+```bash
+VCODE=11 VNAME=2.9 NOTE="说明" bash app/build_apk.sh
 ```
 
 ---
 
-## 这套硬件的一句话总结
+## 四、`test/` —— 8 个硬件测试固件
 
-> 遥控器发 38kHz 调制的 NEC 帧 → 接收头解调成"低电平=有载波"的数字信号 → 进 A4
-> → IRremote 用 Timer2 每 50µs 采样一次、记录每段电平长度 → 主循环解出 32 位键码
-> → 查表得到动作 → 按 L298N 真值表写 D8~D11 → 电机转。
+这些都是排查过程中留下的，**不是主程序**，烧上去车就只剩测试功能。
 
-硬件只有：ATmega328P（Uno 兼容板）、L298N 双 H 桥、38kHz 红外接收头、四个直流电机（左右各两并）。
+| 固件 | 行 | 当初解决什么问题 |
+|---|---|---|
+| `USProbe` | 271 | 超声波分层诊断 —— 发现扩展板 CSB1 插座 5V 没供电 |
+| `USRange` | 402 | 连续测距 + 距离直方图（找死角） |
+| `UltrasonicTest` | 314 | 最早的超声测距（用蜂鸣器提示） |
+| `SonarScan` | 322 | 舵机 + 超声扫描，字符雷达图 |
+| `ServoCenter` | 243 | 180° 舵机对中、量实际行程 |
+| `Servo360` | 309 | 两颗 360° 舵机（左右命名、按角度转、转速标定） |
+| `DiagUS` | 201 | 更早的超声诊断 |
+| `PinScan` | 165 | 110 组引脚组合扫描（找扩展板接线） |
+
+---
+
+## 四半、通信协议（v3.0 起是蓝牙）
+
+车端和 App 之间用**文本命令**，一行一条：
+
+| 命令 | 动作 | 命令 | 动作 |
+|---|---|---|---|
+| `F` | 前进 | `G` / `g` | 遛狗 开 / 关 |
+| `B` | 后退 | `P` / `p` | 比赛 开 / 关 |
+| `L` | 左旋 | `S` | 停止 |
+| `R` | 右旋 | 其他多字符 | 调试参数（`L250`、`S1050`…） |
+
+规则：**长度 1 = 运动命令，长度 >1 = 调试参数**。所以 `L` 是左旋、`L250` 是设左增益，互不冲突。
+
+自动模式的开、关用大小写区分（`G` 开 / `g` 关），各自幂等——重复发一百遍结果一样，丢一帧不会把状态翻过来。
+
+---
+
+## 五、建议的阅读顺序
+
+1. **`遛狗模式.md`** —— 10 分钟，先搞清楚车"想干什么"
+2. **主固件 1 – 270 行** —— 所有参数和它们的含义都在这儿
+3. **`setup()` 1526** 和 **`loop()` 3053** —— 看程序骨架
+4. **`raceDecide()` 2213** + **`serviceDog()` 2598** —— 自动模式的核心
+5. **`setWheels()` 1779 / `buildDuty()` 1678** —— 想知道"为什么左右轮不同步"再看
+
+---
+
+## 六、可以清理的
+
+| 项 | 原因 |
+|---|---|
+| `红外遥控车.apk.1` | 与 `红外遥控车.apk` **md5 完全相同**，白占 827 KB |
+| 根目录的 `SensorTest.ino` | Arduino 要求放在同名目录，现在打不开 |
+| `app/build/` | 编译中间产物，每次构建都会重建 |
+
+---
+
+## 七、两个容易踩的坑
+
+**1. 版本号不能写死在清单里。** `aapt2` 的 `--version-code` 只在清单**缺少**该属性时才注入。清单里写死的话命令行参数会被完全忽略，结果 `version.json` 说 2.9、包里还是 2.8，手机反复提示更新装不上。（2026-11-16 踩过）
+
+**2. EEPROM 里的值优先于源码 `#define`。** 改完源码烧录，如果之前串口发过 `W` 存过盘，跑的还是旧值。要么发 `D` 擦除，要么发 `W` 覆盖。`烧录.bat` 会自动发 `D`。
+
+---
+
+## 八、常用命令
+
+```bash
+# 编译固件
+arduino-cli compile --fqbn arduino:avr:uno DirSpeedTest/
+# 烧录
+arduino-cli upload -p COM9 --fqbn arduino:avr:uno DirSpeedTest/
+# 打包 APK
+VCODE=11 VNAME=2.9 bash app/build_apk.sh
+# 推送（必须走代理，直连会被 reset）
+git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push
+```

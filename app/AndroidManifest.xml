@@ -4,8 +4,15 @@
     android:versionCode="7"
     android:versionName="2.5">
 
-    <uses-permission android:name="android.permission.TRANSMIT_IR" />
     <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- 蓝牙（经典 SPP，连 HC-05）。
+         Android 11 及以下用 BLUETOOTH / BLUETOOTH_ADMIN；
+         Android 12+ 必须用 BLUETOOTH_CONNECT 并在运行时申请。
+         不需要 BLUETOOTH_SCAN：只连已配对设备，从不主动扫描。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!-- 自更新：联网拉 version.json / app.apk -->
     <uses-permission android:name="android.permission.INTERNET" />
